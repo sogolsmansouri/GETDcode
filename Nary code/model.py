@@ -7,10 +7,10 @@ from tensorly.decomposition import tucker, tensor_train, tensor_ring
 from tensorly.decomposition import tucker
 from itertools import combinations
 import string
-
+import opt_einsum as oe  # Make sure this is imported
 
 tl.set_backend('pytorch')
-
+from opt_einsum import contract
 #from tensorly_torch.decomposition import hierarchical_tucker
 
 
@@ -848,87 +848,6 @@ class GETD_HT(nn.Module):
         return pred, W
 
 
-# class GETD_TT2(nn.Module):
-#     def __init__(self, d, d_e, d_r, k, ni_list, tt_rank, device, **kwargs):
-#         super(GETD_TT2, self).__init__()
-#         # embeddings
-#         self.E = nn.Embedding(len(d.entities), d_e, padding_idx=0)
-#         self.R = nn.Embedding(len(d.relations), d_r, padding_idx=0)
-#         nn.init.normal_(self.E.weight, 0, 1e-3)
-#         nn.init.normal_(self.R.weight, 0, 1e-3)
-
-#         # dropout & batchnorm
-#         self.input_dropout  = nn.Dropout(kwargs.get("input_dropout",0.2))
-#         self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout",0.2))
-#         self.bne = nn.BatchNorm1d(d_e)
-#         self.bnr = nn.BatchNorm1d(d_r)
-#         self.bnw = nn.BatchNorm1d(d_e)
-
-#         # only support arity=4
-#         assert len(d.train_data[0]) - 1 == 4
-#         self.ary = 4
-
-#         r = tt_rank
-#         # TT-cores
-#         # G0: [1,   d_r, r]
-#         # G1: [r,   d_e, r]
-#         # G2: [r,   d_e, r]
-#         # G3: [r,   d_e, r]
-#         # G4: [r,   d_e, 1]
-#         self.G0 = nn.Parameter(torch.randn(1,   d_r, r, device=device)*1e-1)
-#         self.G1 = nn.Parameter(torch.randn(r,   d_e, r, device=device)*1e-1)
-#         self.G2 = nn.Parameter(torch.randn(r,   d_e, r, device=device)*1e-1)
-#         self.G3 = nn.Parameter(torch.randn(r,   d_e, r, device=device)*1e-1)
-#         self.G4 = nn.Parameter(torch.randn(r,   d_e, 1, device=device)*1e-1)
-
-#         self.loss = MyLoss()
-
-#     def build_W(self):
-#         # one-shot TT contraction into [d_r, d_e, d_e, d_e, d_e]
-#         W = torch.einsum(
-#             'xpa, aib, bjc, ckd, dlx -> pijkl',
-#              self.G0, self.G1, self.G2, self.G3, self.G4
-#         )
-#         return W  # shape [d_r, d_e, d_e, d_e, d_e]
-
-#     def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
-#         B = r_idx.size(0)
-#         de = self.E.embedding_dim
-#         dr = self.R.embedding_dim
-
-#         # 1) build or reuse full core
-#         if W is None:
-#             W = self.build_W()               # [dr, de, de, de, de]
-
-#         # 2) condition on relation → each batch gets its slice
-#         r_emb = self.bnr(self.R(r_idx))       # [B, dr]
-#         W_mat = torch.mm(r_emb, W.view(dr, -1))  # [B, de^4]
-#         W_mat = W_mat.view(B, de, de, de, de)     # [B, de, de, de, de]
-
-#         # 3) pull out known entities, normalize & dropout
-#         #    e_idx is a tuple/list of the *known* slots in order
-#         if   miss_ent_domain == 1:
-#             e2,e3,e4 = [ self.input_dropout(self.bne(self.E(idx))) for idx in e_idx ]
-#             # leave i
-#             W_out = torch.einsum('bijkl,bj,bk,bl->bi', W_mat, e2,e3,e4)
-#         elif miss_ent_domain == 2:
-#             e1,e3,e4 = [ self.input_dropout(self.bne(self.E(idx))) for idx in e_idx ]
-#             W_out = torch.einsum('bijkl,bi,bk,bl->bj', W_mat, e1,e3,e4)
-#         elif miss_ent_domain == 3:
-#             e1,e2,e4 = [ self.input_dropout(self.bne(self.E(idx))) for idx in e_idx ]
-#             W_out = torch.einsum('bijkl,bi,bj,bl->bk', W_mat, e1,e2,e4)
-#         elif miss_ent_domain == 4:
-#             e1,e2,e3 = [ self.input_dropout(self.bne(self.E(idx))) for idx in e_idx ]
-#             W_out = torch.einsum('bijkl,bi,bj,bk->bl', W_mat, e1,e2,e3)
-#         else:
-#             raise ValueError("miss_ent_domain must be 1..4")
-
-#         # 4) batch-norm, dropout, final score
-#         W_out = self.bnw(W_out)                 # [B, de]
-#         W_out = self.hidden_dropout(W_out)      # [B, de]
-#         x     = torch.mm(W_out, self.E.weight.t())  # [B, #entities]
-#         pred  = F.softmax(x, dim=1)
-#         return pred, W
 
 class GETD_TT(torch.nn.Module):
     def __init__(self, d, d_e, d_r, k, ni_list, ranks_list, device, **kwargs):
@@ -1022,151 +941,277 @@ class GETD_TT(torch.nn.Module):
         return pred, W
 
 
-class GETD_FC(torch.nn.Module):
-    import torch
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from itertools import combinations
+from torch.amp import autocast
+import opt_einsum as oe
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from itertools import combinations
+from torch.amp import autocast
+import opt_einsum as oe
 
 class GETD_FC(nn.Module):
-        
+    """
+    Fully-connected TN with k modes, performing chunked opt-einsum with configurable optimization.
+    """
     def __init__(self, d, d_e, d_r, k, ni_list, rank_list, device, **kwargs):
-        """
-        Fully‐connected TN with k cores (k–1 entities + 1 relation).
-
-        Args:
-          d           : dataset object with d.entities, d.relations
-          d_e         : entity‐embedding dim
-          d_r         : relation‐embedding dim
-          k           : total modes (here 4: three entities + one relation)
-          ni_list     : list of length k giving [n1, n2, n3, n_rel]
-          rank_list   : flat list of length k*(k-1)//2 giving R_ij for each i<j
-          device      : torch device
-        """
         super(GETD_FC, self).__init__()
-        assert len(ni_list) == k, "ni_list must have length k"
+        assert len(ni_list) == k, "ni_list must match k"
         assert len(rank_list) == k*(k-1)//2, f"need {k*(k-1)//2} ranks"
 
-        # 1) build the list of all edges (i<j) in the complete graph on k nodes
-        self.edges = list(combinations(range(k), 2))
+        self.k = k
+        self.device = device
         self.ary = len(d.train_data[0]) - 1
-        # 2) map flat rank_list → dict {(i,j): R_ij}
-        edge_ranks = { self.edges[i]: rank_list[i]
-                       for i in range(len(self.edges)) }
+        # number of relation slices per contraction; smaller -> lower peak memory
+        self.chunk = kwargs.get('contraction_chunk', 1)
+        # opt-einsum strategy: 'optimal', 'greedy', etc.
+        self.optimize = kwargs.get('optimize', 'optimal')
 
-        # 3) embeddings
+        # edges and ranks
+        self.edges = list(combinations(range(k), 2))
+        edge_ranks = {self.edges[i]: rank_list[i] for i in range(len(self.edges))}
+
+        # embeddings
         self.E = nn.Embedding(len(d.entities), d_e, padding_idx=0)
         self.R = nn.Embedding(len(d.relations), d_r, padding_idx=0)
         nn.init.normal_(self.E.weight, std=1e-3)
         nn.init.normal_(self.R.weight, std=1e-3)
 
-        # 4) create one core‐tensor per mode i
-        #    each core G[i] has a bond‐leg for each j≠i of size R_{min(i,j),max(i,j)},
-        #    plus a “physical” leg of size ni_list[i].
+        # core tensors
         self.cores = nn.ParameterList()
         for i in range(k):
-            shape = []
-            
-            for j in range(k):
-                if j == i:
-                    continue
-                e = (i,j) if i<j else (j,i)
-                shape.append(edge_ranks[e])
+            shape = [edge_ranks[(i, j) if i<j else (j, i)]
+                     for j in range(k) if j != i]
             shape.append(ni_list[i])
-            # append the dangling (physical) dimension
-            
-            # Parameter of shape [R_{i,*}, n_i]
-            G_i = nn.Parameter(torch.randn(*shape, device=device) * 1e-1)
-            self.cores.append(G_i)
+            G = nn.Parameter(torch.randn(*shape, device=device) * 1e-1)
+            self.cores.append(G)
 
-        # 5) other modules
+        # batch norms & dropout
         self.bnr = nn.BatchNorm1d(d_r)
         self.bne = nn.BatchNorm1d(d_e)
         self.bnw = nn.BatchNorm1d(d_e)
-        self.input_dropout  = nn.Dropout(kwargs.get("input_dropout", 0.0))
-        self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout", 0.0))
-        self.loss = MyLoss()
-        self.k = k
-        self.ni_list = ni_list
+        self.input_dropout  = nn.Dropout(kwargs.get('input_dropout', 0.0))
+        self.hidden_dropout = nn.Dropout(kwargs.get('hidden_dropout', 0.0))
+        self.loss_fn = kwargs.get('loss_fn', nn.CrossEntropyLoss())
 
     def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
-        de = self.E.weight.shape[1]
-        dr = self.R.weight.shape[1]
+        de = self.E.weight.size(1)
+        dr = self.R.weight.size(1)
 
         if W is None:
-            # unpack your cores
-            if self.k == 4:
-                G0, G1, G2, G3 = self.cores
-                # edges: (0,1)=a, (0,2)=b, (0,3)=c,
-                #        (1,2)=d, (1,3)=e, (2,3)=f
-                # phys dims: i,j,k,l
-                W0 = torch.einsum(
-                    'abci,adej,bdfk,cefl->ijkl',  
-                    G0, G1, G2, G3
-                )
-                # W_data.shape == (n0,n1,n2,n3)
+            parts = []
+            Gs = self.cores
+            # slice along relation core physical leg
+            for start in range(0, dr, self.chunk):
+                end = min(start + self.chunk, dr)
+                Grel = Gs[-1][..., start:end]
+                with autocast('cuda'):
+                    if self.k == 4:
+                        G0, G1, G2 = Gs[0], Gs[1], Gs[2]
+                        subW = oe.contract(
+                            'abci,adej,bdfk,cefl->ijkl',
+                            G0, G1, G2, Grel,
+                            optimize=self.optimize, memory_limit=1e8
+                        )
+                        subW = subW.reshape(end-start, de, de, de)
+                    else:
+                        G0, G1, G2, G3 = Gs[0], Gs[1], Gs[2], Gs[3]
+                        subW = oe.contract(
+                            'abcdp,aefgq,behir,cfhjs,dgijt->pqrst',
+                            G0, G1, G2, G3, Grel,
+                            optimize=self.optimize, memory_limit=1e8
+                        )
+                        subW = subW.reshape(end-start, *([de] * self.ary))
+                parts.append(subW)
+                torch.cuda.empty_cache()
+            W = torch.cat(parts, dim=0)
 
-            elif self.k == 5:
-                G0, G1, G2, G3, G4 = self.cores
-                # edges → letters:
-                # (0,1)=a, (0,2)=b, (0,3)=c, (0,4)=d,
-                # (1,2)=e, (1,3)=f, (1,4)=g,
-                # (2,3)=h, (2,4)=i,
-                # (3,4)=j
-                # phys dims → p,q,r,s,t
-                W0 = torch.einsum(
-                    'abcdp,'   # G0: a,b,c,d → phys p
-                    'aefgq,'   # G1: a,e,f,g → phys q
-                    'behir,'   # G2: b,e,h,i → phys r
-                    'cfhjs,'   # G3: c,f,h,j → phys s
-                    'dgijt->pqrst',  # G4: d,g,i,j → phys t
-                    G0, G1, G2, G3, G4
-                )
-                # W_data.shape == (n0,n1,n2,n3,n4)
+        # apply relation embedding
+        rel = self.bnr(self.R(r_idx))       # [B, dr]
+        W_flat = W.view(dr, -1)              # [dr, de^ary]
+        mix = torch.mm(rel, W_flat)          # [B, de^ary]
+        Wmat = mix.view(-1, *([de] * self.ary))
 
+        # prepare entity embeddings
+        es = [self.input_dropout(self.bne(self.E(idx)))
+              for idx in e_idx]
+
+        # contract out all but missing entity
+        if self.ary == 3:
+            if miss_ent_domain == 1:
+                Wc = torch.einsum('bijk,bi,bj->bk', Wmat, es[1], es[0])
+            elif miss_ent_domain == 2:
+                Wc = torch.einsum('bijk,bi,bk->bj', Wmat, es[1], es[2])
             else:
-                raise ValueError(f"FC TN not implemented for k={self.k}")
+                Wc = torch.einsum('bijk,bj,bk->bi', Wmat, es[0], es[2])
+        else:  # ary == 4
+            if miss_ent_domain == 1:
+                Wc = torch.einsum('bijkl,bj,bk,bl->bi',
+                                  Wmat, es[1], es[2], es[3])
+            elif miss_ent_domain == 2:
+                Wc = torch.einsum('bijkl,bi,bk,bl->bj',
+                                  Wmat, es[0], es[2], es[3])
+            elif miss_ent_domain == 3:
+                Wc = torch.einsum('bijkl,bi,bj,bl->bk',
+                                  Wmat, es[0], es[1], es[3])
+            else:
+                Wc = torch.einsum('bijkl,bi,bj,bk->bl',
+                                  Wmat, es[0], es[1], es[2])
+
+        # final normalization and logits
+        Wc = self.bnw(Wc)
+        Wc = self.hidden_dropout(Wc)
+        logits = torch.mm(Wc, self.E.weight.t())
+        return F.log_softmax(logits, dim=-1), W
+
+
+
+# class GETD_FC(nn.Module):
+        
+#     def __init__(self, d, d_e, d_r, k, ni_list, rank_list, device, **kwargs):
+#         """
+#         Fully‐connected TN with k cores (k–1 entities + 1 relation).
+
+#         Args:
+#           d           : dataset object with d.entities, d.relations
+#           d_e         : entity‐embedding dim
+#           d_r         : relation‐embedding dim
+#           k           : total modes (here 4: three entities + one relation)
+#           ni_list     : list of length k giving [n1, n2, n3, n_rel]
+#           rank_list   : flat list of length k*(k-1)//2 giving R_ij for each i<j
+#           device      : torch device
+#         """
+#         super(GETD_FC, self).__init__()
+#         assert len(ni_list) == k, "ni_list must have length k"
+#         assert len(rank_list) == k*(k-1)//2, f"need {k*(k-1)//2} ranks"
+
+#         # 1) build the list of all edges (i<j) in the complete graph on k nodes
+#         self.edges = list(combinations(range(k), 2))
+#         self.ary = len(d.train_data[0]) - 1
+#         # 2) map flat rank_list → dict {(i,j): R_ij}
+#         edge_ranks = { self.edges[i]: rank_list[i]
+#                        for i in range(len(self.edges)) }
+
+#         # 3) embeddings
+#         self.E = nn.Embedding(len(d.entities), d_e, padding_idx=0)
+#         self.R = nn.Embedding(len(d.relations), d_r, padding_idx=0)
+#         nn.init.normal_(self.E.weight, std=1e-3)
+#         nn.init.normal_(self.R.weight, std=1e-3)
+
+#         # 4) create one core‐tensor per mode i
+#         #    each core G[i] has a bond‐leg for each j≠i of size R_{min(i,j),max(i,j)},
+#         #    plus a “physical” leg of size ni_list[i].
+#         self.cores = nn.ParameterList()
+#         for i in range(k):
+#             shape = []
+            
+#             for j in range(k):
+#                 if j == i:
+#                     continue
+#                 e = (i,j) if i<j else (j,i)
+#                 shape.append(edge_ranks[e])
+#             shape.append(ni_list[i])
+#             # append the dangling (physical) dimension
+            
+#             # Parameter of shape [R_{i,*}, n_i]
+#             G_i = nn.Parameter(torch.randn(*shape, device=device) * 1e-1)
+#             self.cores.append(G_i)
+
+#         # 5) other modules
+#         self.bnr = nn.BatchNorm1d(d_r)
+#         self.bne = nn.BatchNorm1d(d_e)
+#         self.bnw = nn.BatchNorm1d(d_e)
+#         self.input_dropout  = nn.Dropout(kwargs.get("input_dropout", 0.0))
+#         self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout", 0.0))
+#         self.loss = MyLoss()
+#         self.k = k
+#         self.ni_list = ni_list
+     
+
+#     def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
+#         de = self.E.weight.shape[1]
+#         dr = self.R.weight.shape[1]
+
+#         if W is None:
+#             # unpack your cores
+#             if self.k == 4:
+#                 G0, G1, G2, G3 = self.cores
+#                 # edges: (0,1)=a, (0,2)=b, (0,3)=c,
+#                 #        (1,2)=d, (1,3)=e, (2,3)=f
+#                 # phys dims: i,j,k,l
+#                 W0 = torch.einsum(
+#                     'abci,adej,bdfk,cefl->ijkl',  
+#                     G0, G1, G2, G3
+#                 )
+#                 # W_data.shape == (n0,n1,n2,n3)
+
+#             elif self.k == 5:
+#                 G0, G1, G2, G3, G4 = self.cores
+#                 # edges → letters:
+#                 # (0,1)=a, (0,2)=b, (0,3)=c, (0,4)=d,
+#                 # (1,2)=e, (1,3)=f, (1,4)=g,
+#                 # (2,3)=h, (2,4)=i,
+#                 # (3,4)=j
+#                 # phys dims → p,q,r,s,t
+#                 W0 = torch.einsum(
+#                     'abcdp,'   # G0: a,b,c,d → phys p
+#                     'aefgq,'   # G1: a,e,f,g → phys q
+#                     'behir,'   # G2: b,e,h,i → phys r
+#                     'cfhjs,'   # G3: c,f,h,j → phys s
+#                     'dgijt->pqrst',  # G4: d,g,i,j → phys t
+#                     G0, G1, G2, G3, G4
+#                 )
+#                 # W_data.shape == (n0,n1,n2,n3,n4)
+
+#             else:
+#                 raise ValueError(f"FC TN not implemented for k={self.k}")
 
             
-            if self.ary == 3:
-                W = W0.view(dr, de, de, de)
-            elif self.ary == 4:
-                W = W0.view(dr, de, de, de, de)
+#             if self.ary == 3:
+#                 W = W0.view(dr, de, de, de)
+#             elif self.ary == 4:
+#                 W = W0.view(dr, de, de, de, de)
 
-        r = self.bnr(self.R(r_idx))
-        W_mat = torch.mm(r, W.view(r.size(1), -1))
+#         r = self.bnr(self.R(r_idx))
+#         W_mat = torch.mm(r, W.view(r.size(1), -1))
 
-        if self.ary == 3:
-            W_mat = W_mat.view(-1, de, de, de)
-            e2, e3 = self.bne(self.E(e_idx[0])), self.bne(self.E(e_idx[1]))
-            e2, e3 = self.input_dropout(e2), self.input_dropout(e3)
-            if miss_ent_domain == 1:
-                W_mat1 = torch.einsum('ijkl,il,ik->ij', W_mat, e3, e2)
-            elif miss_ent_domain == 2:
-                W_mat1 = torch.einsum('ijkl,il,ij->ik', W_mat, e3, e2)
-            elif miss_ent_domain == 3:
-                W_mat1 = torch.einsum('ijkl,ij,ik->il', W_mat, e2, e3)
+#         if self.ary == 3:
+#             W_mat = W_mat.view(-1, de, de, de)
+#             e2, e3 = self.bne(self.E(e_idx[0])), self.bne(self.E(e_idx[1]))
+#             e2, e3 = self.input_dropout(e2), self.input_dropout(e3)
+#             if miss_ent_domain == 1:
+#                 W_mat1 = torch.einsum('ijkl,il,ik->ij', W_mat, e3, e2)
+#             elif miss_ent_domain == 2:
+#                 W_mat1 = torch.einsum('ijkl,il,ij->ik', W_mat, e3, e2)
+#             elif miss_ent_domain == 3:
+#                 W_mat1 = torch.einsum('ijkl,ij,ik->il', W_mat, e2, e3)
 
-        elif self.ary == 4:
-            W_mat = W_mat.view(-1, de, de, de, de)
-            e2, e3, e4 = [self.bne(self.E(e_idx[i])) for i in range(3)]
-            e2, e3, e4 = [self.input_dropout(e) for e in (e2, e3, e4)]
+#         elif self.ary == 4:
+#             W_mat = W_mat.view(-1, de, de, de, de)
+#             e2, e3, e4 = [self.bne(self.E(e_idx[i])) for i in range(3)]
+#             e2, e3, e4 = [self.input_dropout(e) for e in (e2, e3, e4)]
 
-            if miss_ent_domain == 1:
-                W_mat1 = torch.einsum('ijklm,il,ik,im->ij', W_mat, e3, e2, e4)
-            elif miss_ent_domain == 2:
-                W_mat1 = torch.einsum('ijklm,il,ij,im->ik', W_mat, e3, e2, e4)
-            elif miss_ent_domain == 3:
-                W_mat1 = torch.einsum('ijklm,ij,ik,im->il', W_mat, e2, e3, e4)
-            elif miss_ent_domain == 4:
-                W_mat1 = torch.einsum('ijklm,ij,ik,il->im', W_mat, e2, e3, e4)
+#             if miss_ent_domain == 1:
+#                 W_mat1 = torch.einsum('ijklm,il,ik,im->ij', W_mat, e3, e2, e4)
+#             elif miss_ent_domain == 2:
+#                 W_mat1 = torch.einsum('ijklm,il,ij,im->ik', W_mat, e3, e2, e4)
+#             elif miss_ent_domain == 3:
+#                 W_mat1 = torch.einsum('ijklm,ij,ik,im->il', W_mat, e2, e3, e4)
+#             elif miss_ent_domain == 4:
+#                 W_mat1 = torch.einsum('ijklm,ij,ik,il->im', W_mat, e2, e3, e4)
 
-        W_mat1 = self.bnw(W_mat1)
-        W_mat1 = self.hidden_dropout(W_mat1)
-        x = torch.mm(W_mat1, self.E.weight.transpose(1, 0))
+#         W_mat1 = self.bnw(W_mat1)
+#         W_mat1 = self.hidden_dropout(W_mat1)
+#         x = torch.mm(W_mat1, self.E.weight.transpose(1, 0))
 
-        pred = F.softmax(x, dim=1)
+#         pred = F.softmax(x, dim=1)
 
-        return pred, W
+#         return pred, W
 
 
 class GETD(torch.nn.Module):
@@ -1378,112 +1423,6 @@ class GETD_HT2(nn.Module):
         return pred, W
 
 
-# class HTCore(nn.Module):
-#     def __init__(self, d_e, d_r, rank, device, arity):
-#         super().__init__()
-#         self.arity = arity
-#         self.d_e = d_e
-#         self.d_r = d_r
-#         self.rank = rank
-#         self.device = device
-#         self.cores = nn.ParameterList()
-#         # First core: [d_r, d_e, rank]
-#         self.cores.append(nn.Parameter(torch.randn(d_r, d_e, rank, device=device) * 1e-2))
-#         # Middle cores: [rank, d_e, rank] (arity-2 of them)
-#         for _ in range(arity - 2):
-#             self.cores.append(nn.Parameter(torch.randn(rank, d_e, rank, device=device) * 1e-2))
-#         # Last core: [rank, d_e]
-#         self.cores.append(nn.Parameter(torch.randn(rank, d_e, device=device) * 1e-2))
-
-
-#     def forward(self, r_embed, E_list):
-#         """
-#         r_embed: [B, d_r]
-#         E_list: list of [B, d_e], length = arity-1
-#         """
-#         # First core: [d_r, d_e, rank]
-#         x = torch.einsum('br,rdk,bd->bk', r_embed, self.cores[0], E_list[0])  # [B, rank]
-#         # Middle cores: [rank, d_e, rank]
-#         for i, core in enumerate(self.cores[1:-1]):
-#             # x: [B, rank], core: [rank, d_e, rank], E_list[i+1]: [B, d_e]
-#             x = torch.einsum('bk,kdr,bd->br', x, core, E_list[i+1])  # [B, rank]
-#         # Last core: [rank, d_e]
-#         x = torch.einsum('bk,kd->bd', x, self.cores[-1])  # [B, d_e]
-#         return x
-
-
-
-# class GETD_HT(nn.Module):
-#     def __init__(self, d, d_e, d_r, k, ni, ranks, device, input_dropout=0.0, hidden_dropout=0.0):
-#         super().__init__()
-#         self.E = nn.Embedding(len(d.entities), embedding_dim=d_e, padding_idx=0)
-#         self.R = nn.Embedding(len(d.relations), embedding_dim=d_r, padding_idx=0)
-#         self.E.weight.data = (1e-2 * torch.randn((len(d.entities), d_e), dtype=torch.float).to(device))
-#         self.R.weight.data = (1e-2 * torch.randn((len(d.relations), d_r), dtype=torch.float).to(device))
-
-#         self.loss = MyLoss()
-#         self.ary = len(d.train_data[0]) - 1
-#         self.htcore = HTCore(d_e, d_r, ranks, device, arity=self.ary)
-#         self.input_dropout = nn.Dropout(input_dropout)
-#         self.hidden_dropout = nn.Dropout(hidden_dropout)
-
-#     def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
-#         r_embed = self.R(r_idx)  # [B, d_r]
-#         E_list = [self.input_dropout(self.E(idx)) for idx in e_idx]  # List of [B, d_e]
-#         core_out = self.htcore(r_embed, E_list)   # [B, d_e]
-#         scores = torch.mm(core_out, self.E.weight.T)   # [B, num_entities]
-#         pred = F.softmax(scores, dim=1)
-#         return pred, None
-
-
-    
-# class HTCore(nn.Module):
-#     def __init__(self, d_e, rank, device, arity):
-#         super().__init__()
-#         self.arity = arity
-#         self.d_e = d_e
-#         self.rank = rank
-#         self.device = device
-#         self.cores = nn.ParameterList()
-#         # First core: [d_e, d_e, rank]
-#         self.cores.append(nn.Parameter(torch.randn(d_e, d_e, rank, device=device) * 1e-2))
-#         # Middle cores: [rank, d_e, rank]
-#         for _ in range(arity - 3):
-#             self.cores.append(nn.Parameter(torch.randn(rank, d_e, rank, device=device) * 1e-2))
-#         # Last core: [rank, d_e]
-#         self.cores.append(nn.Parameter(torch.randn(rank, d_e, device=device) * 1e-2))
-
-#     def forward(self, E_list, r_embed=None):
-#         x = torch.einsum('bd,def,be->bf', E_list[0], self.cores[0], E_list[1])
-#         for i in range(2, self.arity - 1):
-#             x = torch.einsum('bf,fdg,bd->bg', x, self.cores[i-1], E_list[i])
-#         # Instead of reducing to [B, 1], expand to [B, d_e]:
-#         x = torch.einsum('bf,fd->bd', x, self.cores[-1])
-#         return x
-
-# class GETD_HT(nn.Module):
-#     def __init__(self, d, d_e, d_r, k, ni, ranks, device, input_dropout=0.0, hidden_dropout=0.0):
-#         super().__init__()
-#         self.E = nn.Embedding(len(d.entities), embedding_dim=d_e, padding_idx=0)
-#         self.R = nn.Embedding(len(d.relations), embedding_dim=d_r, padding_idx=0)
-#         self.E.weight.data = (1e-2 * torch.randn((len(d.entities), d_e), dtype=torch.float).to(device))
-#         self.R.weight.data = (1e-2 * torch.randn((len(d.relations), d_r), dtype=torch.float).to(device))
-
-#         self.loss = MyLoss()
-#         self.ary = len(d.train_data[0]) - 1
-#         self.htcore = HTCore(d_e, ranks, device, arity=self.ary)
-#         self.input_dropout = nn.Dropout(input_dropout)
-#         self.hidden_dropout = nn.Dropout(hidden_dropout)
-
-#     def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
-#         E_list = [self.E(e_idx[i]) for i in range(len(e_idx))]
-#         E_list = [self.input_dropout(e) for e in E_list]
-#         core_out = self.htcore(E_list)   # [B, d_e]
-#         scores = torch.mm(core_out, self.E.weight.T)   # [B, num_entities]
-#         pred = F.softmax(scores, dim=1)
-#         return pred, None
-
-
 
 
 class HT(nn.Module):
@@ -1617,299 +1556,6 @@ class HT(nn.Module):
         pred = F.softmax(scores, dim=1)
         return pred, None
 
-
-# class HT(nn.Module):
-#     def __init__(self, d, d_e, d_r, k, ni, ranks, device, **kwargs):
-#         super(HT, self).__init__()
-#         self.E = nn.Embedding(len(d.entities), embedding_dim=d_e, padding_idx=0)
-#         self.R = nn.Embedding(len(d.relations), embedding_dim=d_r, padding_idx=0)
-#         self.E.weight.data = (1e-3 * torch.randn((len(d.entities), d_e), dtype=torch.float, device=device))
-#         self.R.weight.data = (1e-3 * torch.randn((len(d.relations), d_r), dtype=torch.float, device=device))
-#         self.input_dropout = nn.Dropout(kwargs.get("input_dropout", 0.2))
-#         self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout", 0.2))
-#         self.bne = nn.BatchNorm1d(d_e)
-#         self.bnr = nn.BatchNorm1d(d_r)
-#         self.bnw = nn.BatchNorm1d(d_e)
-#         self.ary = len(d.train_data[0]) - 1  # k
-#         # HT core tensors (internal nodes and leaves)
-#         self.k = k
-#         self.d_e = d_e
-#         self.d_r = d_r
-#         self.ni = ni
-#         self.ranks = ranks
-#         # For 4-ary, HT tree is:
-#         #           (root)
-#         #         /      \
-#         #      v1         v2
-#         #    /   \      /   \
-#         #  e1    e2   e3    e4
-#         # Parameters: root, left, right, and 4 leaves
-#         rank = ranks  # set rank = HT rank (usually = d_e or lower)
-#         self.ht_root = nn.Parameter(torch.randn(rank, rank, d_r) * 1e-1)  # (r, r, d_r)
-#         self.ht_left = nn.Parameter(torch.randn(rank, d_e, d_e) * 1e-1)   # (r, d_e, d_e)
-#         self.ht_right = nn.Parameter(torch.randn(rank, d_e, d_e) * 1e-1)  # (r, d_e, d_e)
-#         self.loss = MyLoss()
-
-#     def build_W(self):
-#         """
-#         Build the HT core tensor for 4-ary relation: [d_r, d_e, d_e, d_e, d_e]
-#         """
-#         # (r, r, d_r), (r, d_e, d_e), (r, d_e, d_e)
-#         root = self.ht_root         # (r, r, d_r)
-#         left = self.ht_left         # (r, d_e, d_e)
-#         right = self.ht_right       # (r, d_e, d_e)
-#         # Compose left leaf: (r, d_e, d_e) -> (d_e, r, d_e)
-#         # Compose right leaf: (r, d_e, d_e) -> (d_e, r, d_e)
-#         # Compose everything to get final (d_r, d_e, d_e, d_e, d_e)
-#         # (r, d_e, d_e) + (r, d_e, d_e) + (r, r, d_r)
-#         # Output: [d_r, d_e, d_e, d_e, d_e] (same as TR)
-#         # We'll contract on the r indices
-#         # Final einsum: root[r1, r2, dr], left[r1, de2, de1], right[r2, de3, de4]
-#         # Output: (dr, de1, de2, de3, de4)
-#         #          ijk, ila, jbc -> kabcl
-
-#         # Note: einsum indices: i, j = rank; k = d_r; a, b, c, l = d_e
-#         # Final output: (d_r, d_e, d_e, d_e, d_e)
-#         W = torch.einsum('ijk,ila,jbc->kabcl', root, left, right)  # (d_r, d_e, d_e, d_e, d_e)
-#         return W
-
-#     def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
-#         de = self.E.weight.shape[1]
-#         dr = self.R.weight.shape[1]
-#         if W is None:
-#             W = self.build_W()
-
-#         r = self.bnr(self.R(r_idx))  # [B, d_r]
-#         W_mat = torch.mm(r, W.reshape(r.size(1), -1))  # [B, d_e**4]
-#         W_mat = W_mat.reshape(-1, de, de, de, de)
-
-#         # Get entities: e2, e3, e4 (miss_ent_domain=1 means e1 is missing, etc.)
-#         e2, e3, e4 = self.E(e_idx[0]), self.E(e_idx[1]), self.E(e_idx[2])
-#         e2, e3, e4 = self.bne(e2), self.bne(e3), self.bne(e4)
-#         e2, e3, e4 = self.input_dropout(e2), self.input_dropout(e3), self.input_dropout(e4)
-#         if miss_ent_domain == 1:  
-#             W_mat1 = torch.einsum('ijklm,il,ik,im->ij', W_mat, e3, e2, e4)
-#         elif miss_ent_domain == 2:
-#             W_mat1 = torch.einsum('ijklm,il,ij,im->ik', W_mat, e3, e2, e4)
-#         elif miss_ent_domain == 3:
-#             W_mat1 = torch.einsum('ijklm,ij,ik,im->il', W_mat, e2, e3, e4)
-#         elif miss_ent_domain == 4:
-#             W_mat1 = torch.einsum('ijklm,ij,ik,il->im', W_mat, e2, e3, e4)
-#         W_mat1 = self.bnw(W_mat1)
-#         W_mat1 = self.hidden_dropout(W_mat1)
-#         x = torch.mm(W_mat1, self.E.weight.transpose(1, 0))  # [B, num_entities]
-
-#         pred = F.softmax(x, dim=1)
-#         return pred, W
-
-# class GETD(torch.nn.Module):
-#     def __init__(self, d, d_e, d_r, k, ni, ranks, device, **kwargs):
-#         super(GETD, self).__init__()
-#         self.E = torch.nn.Embedding(len(d.entities), embedding_dim=d_e, padding_idx=0)
-#         self.R = torch.nn.Embedding(len(d.relations), embedding_dim=d_r, padding_idx=0)
-#         self.E.weight.data = (1e-3*torch.randn((len(d.entities), d_e), dtype=torch.float).to(device))
-#         self.R.weight.data = (1e-3*torch.randn((len(d.relations), d_r), dtype=torch.float).to(device))
-#         self.Zlist = torch.nn.ParameterList([torch.nn.Parameter(torch.tensor(np.random.uniform(-1e-1, 1e-1, (ranks, ni, ranks)), dtype=torch.float, requires_grad=True).to(device)) for _ in range(k)])
-#         self.loss = MyLoss()
-#         self.input_dropout = torch.nn.Dropout(kwargs["input_dropout"])
-#         self.hidden_dropout = torch.nn.Dropout(kwargs["hidden_dropout"])
-#         self.bne = torch.nn.BatchNorm1d(d_e)
-#         self.bnr = torch.nn.BatchNorm1d(d_r)
-#         self.bnw = torch.nn.BatchNorm1d(d_e)
-#         self.ary = len(d.train_data[0])-1
-
-#     def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
-#         de = self.E.weight.shape[1]
-#         dr = self.R.weight.shape[1]
-#         if W is None:
-#             k = len(self.Zlist)
-#             Zlist = [Z for Z in self.Zlist]
-#             if k == 4:
-#                 W0 = torch.einsum('aib,bjc,ckd,dla->ijkl', Zlist)
-#             elif k == 5:
-#                 W0 = torch.einsum('aib,bjc,ckd,dle,ema->ijklm', Zlist)
-#             else:
-#                 print('TR equation is not defined already!')
-#                 raise ValueError(f"TR equation is not defined for k = {k}")
-#             if self.ary == 3:
-#                 W = W0.view(dr, de, de, de)
-#             elif self.ary == 4:
-#                 W = W0.view(dr, de, de, de, de)
-
-#         r = self.bnr(self.R(r_idx))
-#         W_mat = torch.mm(r, W.view(r.size(1), -1))
-
-#         if self.ary == 3:
-#             W_mat = W_mat.view(-1, de, de, de)
-#             e2, e3 = self.E(e_idx[0]), self.E(e_idx[1])
-#             e2, e3 = self.bne(e2), self.bne(e3)
-#             e2, e3 = self.input_dropout(e2), self.input_dropout(e3)
-#             if miss_ent_domain == 1:  
-#                 W_mat1 = torch.einsum('ijkl,il,ik->ij', W_mat, e3, e2)
-#             elif miss_ent_domain == 2:
-#                 W_mat1 = torch.einsum('ijkl,il,ij->ik', W_mat, e3, e2)
-#             elif miss_ent_domain == 3:
-#                 W_mat1 = torch.einsum('ijkl,ij,ik->il', W_mat, e2, e3)
-#             W_mat1 = self.bnw(W_mat1)
-#             W_mat1 = self.hidden_dropout(W_mat1)
-#             x = torch.mm(W_mat1, self.E.weight.transpose(1, 0))
-
-#         if self.ary == 4:
-#             W_mat = W_mat.view(-1, de, de, de, de)
-#             e2, e3, e4 = self.E(e_idx[0]), self.E(e_idx[1]), self.E(e_idx[2])
-#             e2, e3, e4 = self.bne(e2), self.bne(e3), self.bne(e4)
-#             e2, e3, e4 = self.input_dropout(e2), self.input_dropout(e3), self.input_dropout(e4)
-#             if miss_ent_domain == 1:  
-#                 W_mat1 = torch.einsum('ijklm,il,ik,im->ij', W_mat, e3, e2, e4)
-#             elif miss_ent_domain == 2:
-#                 W_mat1 = torch.einsum('ijklm,il,ij,im->ik', W_mat, e3, e2, e4)
-#             elif miss_ent_domain == 3:
-#                 W_mat1 = torch.einsum('ijklm,ij,ik,im->il', W_mat, e2, e3, e4)
-#             elif miss_ent_domain == 4:
-#                 W_mat1 = torch.einsum('ijklm,ij,ik,il->im', W_mat, e2, e3, e4)
-#             W_mat1 = self.bnw(W_mat1)
-#             W_mat1 = self.hidden_dropout(W_mat1)
-#             x = torch.mm(W_mat1, self.E.weight.transpose(1, 0))
-
-#         pred = F.softmax(x, dim=1)
-
-#         return pred, W
-
-
-
-
-# class GETD_TT(torch.nn.Module):
-#     def __init__(self, d, d_e, d_r, k, n_i, ranks, device, **kwargs):
-#         """
-#         d: Data object (must have d.entities, d.relations, and d.train_data)
-#         d_e: entity embedding dimension
-#         d_r: relation embedding dimension
-#         k, n_i: (ignored) kept for API compatibility with GETD
-#         ranks: used as the TT rank for the decomposition
-#         device: torch device (e.g., 'cuda:0')
-#         kwargs: dictionary containing 'input_dropout' and 'hidden_dropout'
-#         """
-#         super(GETD_TT, self).__init__()
-#         # Embedding layers for entities and relations.
-#         self.E = torch.nn.Embedding(len(d.entities), embedding_dim=d_e, padding_idx=0)
-#         self.R = torch.nn.Embedding(len(d.relations), embedding_dim=d_r, padding_idx=0)
-#         self.E.weight.data = 1e-3 * torch.randn((len(d.entities), d_e), device=device)
-#         self.R.weight.data = 1e-3 * torch.randn((len(d.relations), d_r), device=device)
-
-#         self.loss = MyLoss()
-#         self.input_dropout = torch.nn.Dropout(kwargs["input_dropout"])
-#         self.hidden_dropout = torch.nn.Dropout(kwargs["hidden_dropout"])
-#         self.bne = torch.nn.BatchNorm1d(d_e)
-#         self.bnr = torch.nn.BatchNorm1d(d_r)
-#         self.bnw = torch.nn.BatchNorm1d(d_e)
-
-#         # Determine the relation arity from training data.
-#         # For a training sample like (relation, e1, e2, e3) => arity==3 (one relation + three entities)
-#         self.ary = len(d.train_data[0]) - 1  
-#         # We want to form a transformation tensor W with shape:
-#         #   if ary==3: (d_r, d_e, d_e, d_e)
-#         #   if ary==4: (d_r, d_e, d_e, d_e, d_e)
-#         # The number of modes is 1 + ary.
-#         self.modes = 1 + self.ary
-#         # Mode sizes: first mode from relation embedding and the rest from entity embedding.
-#         self.mode_sizes = [d_r] + [d_e] * self.ary
-#         # TT ranks: first and last are 1; use the provided 'ranks' for the intermediate ranks.
-#         self.tt_ranks = [1] + [ranks] * (self.modes - 1) + [1]
-#         # Initialize TT cores. Each core i has shape (tt_ranks[i], mode_sizes[i], tt_ranks[i+1])
-#         self.TTcores = torch.nn.ParameterList()
-#         for i in range(self.modes):
-#             core_shape = (self.tt_ranks[i], self.mode_sizes[i], self.tt_ranks[i+1])
-#             core = torch.nn.Parameter(torch.randn(core_shape, device=device) * 0.01)
-#             self.TTcores.append(core)
-
-#     def tt_contract(self):
-#         """
-#         Sequentially contracts the TT cores to form the full transformation tensor W.
-#         The final tensor will have extra singleton dimensions at the beginning and end, which we remove.
-#         Returns:
-#           W: Tensor of shape (d_r, d_e, ..., d_e) where the number of d_e dims is equal to self.ary.
-#         """
-#         # Start with the first core. Its shape is (1, d_r, r) where r = self.tt_ranks[1]
-#         W = self.TTcores[0]
-#         for i in range(1, self.modes):
-#             core = self.TTcores[i]  # shape: (r, mode_sizes[i], r_next)
-#             # Contract the last dimension of W with the first dimension of core:
-#             # If W: (..., r) and core: (r, m, r_next), then use einsum: '...r, rms -> ...ms'
-#             W = torch.einsum('...r, rms -> ...ms', W, core)
-#         # W now has shape (1, d_r, d_e, ..., d_e, 1). Remove the outer singleton dimensions.
-#         W = W.squeeze(0).squeeze(-1)
-#         return W
-
-#     def forward(self, r_idx, e_idx, miss_ent_domain, W_given=None):
-#         """
-#         r_idx: LongTensor of relation indices (batch_size,)
-#         e_idx: List of LongTensors with known entity indices.
-#         miss_ent_domain: int indicating which entity is missing (1,2,...,ary)
-#         W_given: Optional external transformation tensor.
-#         """
-#         de = self.E.weight.shape[1]
-#         dr = self.R.weight.shape[1]
-#         if W_given is None:
-#             W_full = self.tt_contract()  # Shape: (d_r, d_e, ..., d_e)
-#             W = W_full
-#         else:
-#             W = W_given
-
-#         # Process the relation embedding.
-#         r = self.bnr(self.R(r_idx))  # shape: (batch_size, d_r)
-#         # Flatten all but the first dimension of W to do a matrix multiplication.
-#         W_mat = torch.mm(r, W.view(dr, -1))  # shape: (batch_size, product_of_entity_dims)
-
-#         if self.ary == 3:
-#             W_mat = W_mat.view(-1, de, de, de)
-#             if miss_ent_domain == 1:
-#                 # Missing first entity; provided: e2, e3.
-#                 e2, e3 = self.E(e_idx[0]), self.E(e_idx[1])
-#                 e2, e3 = self.bne(e2), self.bne(e3)
-#                 e2, e3 = self.input_dropout(e2), self.input_dropout(e3)
-#                 W_mat1 = torch.einsum('ijkl,il,ik->ij', W_mat, e3, e2)
-#             elif miss_ent_domain == 2:
-#                 # Missing second entity; provided: e1, e3.
-#                 e1, e3 = self.E(e_idx[0]), self.E(e_idx[1])
-#                 e1, e3 = self.bne(e1), self.bne(e3)
-#                 e1, e3 = self.input_dropout(e1), self.input_dropout(e3)
-#                 W_mat1 = torch.einsum('ijkl,ik,ij->il', W_mat, e1, e3)
-#             elif miss_ent_domain == 3:
-#                 # Missing third entity; provided: e1, e2.
-#                 e1, e2 = self.E(e_idx[0]), self.E(e_idx[1])
-#                 e1, e2 = self.bne(e1), self.bne(e2)
-#                 e1, e2 = self.input_dropout(e1), self.input_dropout(e2)
-#                 W_mat1 = torch.einsum('ijkl,ij,il->ik', W_mat, e1, e2)
-#             W_mat1 = self.bnw(W_mat1)
-#             W_mat1 = self.hidden_dropout(W_mat1)
-#             x = torch.mm(W_mat1, self.E.weight.transpose(1, 0))
-#         elif self.ary == 4:
-#             W_mat = W_mat.view(-1, de, de, de, de)
-#             if miss_ent_domain == 1:
-#                 e2, e3, e4 = self.E(e_idx[0]), self.E(e_idx[1]), self.E(e_idx[2])
-#                 e2, e3, e4 = self.bne(e2), self.bne(e3), self.bne(e4)
-#                 e2, e3, e4 = self.input_dropout(e2), self.input_dropout(e3), self.input_dropout(e4)
-#                 W_mat1 = torch.einsum('ijklm,il,ik,im->ij', W_mat, e3, e2, e4)
-#             elif miss_ent_domain == 2:
-#                 e1, e3, e4 = self.E(e_idx[0]), self.E(e_idx[1]), self.E(e_idx[2])
-#                 e1, e3, e4 = self.bne(e1), self.bne(e3), self.bne(e4)
-#                 e1, e3, e4 = self.input_dropout(e1), self.input_dropout(e3), self.input_dropout(e4)
-#                 W_mat1 = torch.einsum('ijklm,ik,ij,im->il', W_mat, e1, e3, e4)
-#             elif miss_ent_domain == 3:
-#                 e1, e2, e4 = self.E(e_idx[0]), self.E(e_idx[1]), self.E(e_idx[2])
-#                 e1, e2, e4 = self.bne(e1), self.bne(e2), self.bne(e4)
-#                 e1, e2, e4 = self.input_dropout(e1), self.input_dropout(e2), self.input_dropout(e4)
-#                 W_mat1 = torch.einsum('ijklm,ij,ik,im->ik', W_mat, e1, e2, e4)
-#             elif miss_ent_domain == 4:
-#                 e1, e2, e3 = self.E(e_idx[0]), self.E(e_idx[1]), self.E(e_idx[2])
-#                 e1, e2, e3 = self.bne(e1), self.bne(e2), self.bne(e3)
-#                 e1, e2, e3 = self.input_dropout(e1), self.input_dropout(e2), self.input_dropout(e3)
-#                 W_mat1 = torch.einsum('ijklm,ij,ik,il->im', W_mat, e1, e2, e3)
-#             W_mat1 = self.bnw(W_mat1)
-#             W_mat1 = self.hidden_dropout(W_mat1)
-#             x = torch.mm(W_mat1, self.E.weight.transpose(1, 0))
-#         pred = F.softmax(x, dim=1)
-#         return pred, W
 
 
 

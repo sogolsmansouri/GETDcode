@@ -190,7 +190,7 @@ class Experiment:
         if self.decay_rate:
             scheduler = ExponentialLR(opt, self.decay_rate)
 
-        
+        torch.cuda.empty_cache()
         best_valid_iter = 0
         best_valid_metric = {'mrr': -1, 'test_mrr': -1, 'test_hit1': -1, 'test_hit3': -1, 'test_hit10': -1}
 
@@ -245,7 +245,7 @@ class Experiment:
                     loss = model.loss(pred, label)
                     loss.backward()
                     opt.step()
-
+                    torch.cuda.empty_cache()
                     losses.append(loss.item())
 
             print('\nEpoch %d train, loss=%f' % (it, np.mean(losses, axis=0)))
@@ -311,6 +311,20 @@ if __name__ == '__main__':
         type=int,
         default=None,
         help="(Optional) Hidden size of the small 2-layer MLP in HT_ENHANCED"
+    )
+    parser.add_argument(
+    "--optimize",
+    choices=["optimal", "greedy"],
+    default="optimal",
+    help="Opt-einsum contraction strategy"
+    )
+
+    # Already have:
+    parser.add_argument(
+        "--contraction_chunk",
+        type=int,
+        default=1,
+        help="Chunk size for Tucker‐FC contraction",
     )
 
     args = parser.parse_args()
