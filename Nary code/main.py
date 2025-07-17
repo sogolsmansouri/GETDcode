@@ -154,7 +154,7 @@ class Experiment:
              hidden_dropout=args.hidden_dropout)
         elif args.method == 'FC':
             #model = GETD(d, args.edim, args.rdim, args.k, args.n_i, args.TR_ranks, device, input_dropout=args.input_dropout, hidden_dropout=args.hidden_dropout)
-            model = GETD_FC(d, args.edim, args.rdim, args.k, args.ni_list, args.rank_list, device,
+            model = GETD_FC(d, args.edim, args.rdim, args.ni_list, args.rank_list, device,
              input_dropout=args.input_dropout,
              hidden_dropout=args.hidden_dropout)
             print("Edges:", model.edges)
@@ -271,7 +271,7 @@ class Experiment:
                         it, best_valid_iter, it - best_valid_iter, best_valid_metric['test_mrr']))
                 print('Epoch %d test, MRR=%.8f, Hits@10=%f, Hits@3=%f, Hits@1=%f' % (it, t_mrr, t_hit10, t_hit3, t_hit1))
 
-                if (it-best_valid_iter) >= 10 or it == self.num_iterations:
+                if  it == self.num_iterations: #(it-best_valid_iter) >= 10 or
                     print('++++++++++++ Early Stopping +++++++++++++')
                     print('Best epoch %d' % best_valid_iter)
                     print('Mean reciprocal rank: {0}'.format(best_valid_metric['test_mrr']))
@@ -312,21 +312,7 @@ if __name__ == '__main__':
         default=None,
         help="(Optional) Hidden size of the small 2-layer MLP in HT_ENHANCED"
     )
-    parser.add_argument(
-    "--optimize",
-    choices=["optimal", "greedy"],
-    default="optimal",
-    help="Opt-einsum contraction strategy"
-    )
-
-    # Already have:
-    parser.add_argument(
-        "--contraction_chunk",
-        type=int,
-        default=1,
-        help="Chunk size for Tucker‐FC contraction",
-    )
-
+    
     args = parser.parse_args()
     dataset = args.dataset
     data_dir = "./data/%s/" % dataset
