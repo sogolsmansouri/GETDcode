@@ -940,47 +940,56 @@ class GETD_TT(torch.nn.Module):
 
         return pred, W
 
-
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import time
+import logging
+from itertools import combinations
+import torch.nn.init as init
+# Configure logging to file
+logging.basicConfig(
+    filename='profiling.log',
+    filemode='a',  # append mode
+    format='%(asctime)s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    level=logging.INFO
+)
 
 class GETD_FC(nn.Module):
     """
-    Fully-connected Tensor-Ring GETD model with on-the-fly contraction.
-
-    Modes: 0 = relation, 1..k-1 = entities (k total modes).
-    Cores: one per mode, each tensor shaped by bond dimensions and a physical dimension.
+    Fully-connected GETD model with on-the-fly contraction,
+    optimized bond collapse, combined core+embed, and profiling.
+    Profiling messages are written to 'profiling.log'.
     """
-    def __init__(self, data, d_e, d_r, ni_list, rank_list, device, **kwargs): 
+    def __init__(self, data, d_e, d_r, ni_list, rank_list, device, **kwargs):
         super().__init__()
         self.k = len(ni_list)
         assert self.k >= 2, "Need at least relation + entities"
         assert len(rank_list) == self.k*(self.k-1)//2, \
             f"need {self.k*(self.k-1)//2} bond ranks, got {len(rank_list)}"
+
         # Precompute edges and bond ranks
         self.edges = list(combinations(range(self.k), 2))
         self.bond_ranks = {edge: rank_list[i] for i, edge in enumerate(self.edges)}
         self.ni_list = ni_list
-        # Embeddings
 
-        self.E = torch.nn.Embedding(len(data.entities), embedding_dim=d_e, padding_idx=0)
-        self.R = torch.nn.Embedding(len(data.relations), embedding_dim=d_r, padding_idx=0)
-        
+        # Embeddings
+        self.E = nn.Embedding(len(data.entities), d_e, padding_idx=0).to(device)
+        self.R = nn.Embedding(len(data.relations), d_r, padding_idx=0).to(device)
+        # nn.init.normal_(self.E.weight, std=1e-3)
+        # nn.init.normal_(self.R.weight, std=1e-3)
         self.E.weight.data = (1e-3 * torch.randn((len(data.entities), d_e), dtype=torch.float).to(device))
         self.R.weight.data = (1e-3 * torch.randn((len(data.relations), d_r), dtype=torch.float).to(device))
         # Core tensors
         # self.cores = nn.ParameterList()
         # for i in range(self.k):
-        #     shape = []
-        #     for j in range(self.k):
-        #         if i == j: continue
-        #         edge = (i, j) if i < j else (j, i)
-        #         shape.append(self.bond_ranks[edge])
-        #     shape.append(self.ni_list[i])
-        #     G = nn.Parameter(torch.randn(*shape, device=device) * 1e-2)
-            
+        #     dims = [self.bond_ranks[(i,j)] if i<j else self.bond_ranks[(j,i)]
+        #             for j in range(self.k) if j!=i]
+        #     dims.append(self.ni_list[i])
+        #     G = nn.Parameter(torch.empty(*dims, device=device).uniform_(-1e-1,1e-1))
         #     self.cores.append(G)
-            
-            
-        # Core tensors
+        
         self.cores = torch.nn.ParameterList()
         for i in range(self.k):
             shape = []
@@ -1000,153 +1009,288 @@ class GETD_FC(nn.Module):
                 ).to(device)
             )
             self.cores.append(G)
+            
+            for G in self.cores:
+                if G.dim() > 1:
+                    init.xavier_uniform_(G)
+
+
         # Norms & dropout
-        
         self.bnr = nn.BatchNorm1d(d_r)
         self.bne = nn.BatchNorm1d(d_e)
         self.bnw = nn.BatchNorm1d(d_e)
-        self.input_dropout  = nn.Dropout(kwargs.get("input_dropout", 0.0))
-        self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout", 0.0))
+        self.input_dropout  = nn.Dropout(kwargs.get("input_dropout",0.0))
+        self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout",0.0))
         self.loss = MyLoss()
-        
-    def forward(self, r_idx, e_idx_list, miss, W=None):
-        B = r_idx.size(0)
-        #print(f"\n=== RUN miss={miss}  batch={B} ===")
 
-        # subscripts for einsum
+    def forward(self, r_idx, e_idx_list, miss, W=None):
+        torch.cuda.reset_peak_memory_stats()
+        B = r_idx.size(0)
+
+        # Subscript letters
         bond_letters = {e: chr(ord('a')+i) for i,e in enumerate(self.edges)}
         phys_letters = [chr(ord('A')+m) for m in range(self.k)]
 
-        # 1) embed relation + fuse G0
-        R0 = self.R(r_idx)
-        #print(f"[1] R0.shape = {tuple(R0.shape)}")
-        R0 = self.bnr(R0)
-        R0 = self.input_dropout(R0)
-        G0 = self.cores[0]
+        # Step1: Fuse relation into core0
+        start = time.time()
+        R0 = self.input_dropout(self.bnr(self.R(r_idx)))  # (B, c0)
         p0 = phys_letters[0]
         b0 = [bond_letters[e] for e in self.edges if 0 in e]
         eq0 = f"z{p0},{''.join(b0)+p0}->z{''.join(b0)}"
-        #print(f"[2] Fuse G0: G0.shape={tuple(G0.shape)}  einsum='{eq0}'")
-        T = torch.einsum(eq0, R0, G0)
+        T = torch.einsum(eq0, R0, self.cores[0])
+        mem1 = torch.cuda.max_memory_allocated()/1024**2
+        logging.info(f"Step1 fuse relation: time={time.time()-start:.4f}s, mem={mem1:.1f}MiB")
         sub = 'z' + ''.join(b0)
-        #print(f"[2] → T.shape={tuple(T.shape)}, sub='{sub}'")
 
-        # 2) fuse all non-missing entity cores (keep all bonds)
-        for m in range(1, self.k):
-            if m == miss: continue
+        # Step2: Combined fuse+absorb for each known entity
+        start = time.time()
+        idx_known = 0
+        for m in range(1,self.k):
+            if m==miss: continue
             Gm = self.cores[m]
             pm = phys_letters[m]
             bm = [bond_letters[e] for e in self.edges if m in e]
-            eqf = f"{sub},{''.join(bm)+pm}->{sub+pm}"
-            #print(f"[3.{m}] Fuse G{m}: shape={tuple(Gm.shape)}  einsum='{eqf}'")
-            T = torch.einsum(eqf, T, Gm)
-            sub += pm
-            #print(f"[3.{m}] → T.shape={tuple(T.shape)}, sub='{sub}'")
+            Em = self.input_dropout(self.bne(self.E(e_idx_list[idx_known])))
+            idx_known += 1
+            eq = f"{sub},{''.join(bm)+pm},z{pm}->{sub}"
+            T = torch.einsum(eq, T, Gm, Em)
+        mem2 = torch.cuda.max_memory_allocated()/1024**2
+        logging.info(f"Step2 fuse+absorb entities: time={time.time()-start:.4f}s, mem={mem2:.1f}MiB")
 
-        # 3) absorb all non-missing embeddings (collapse phys legs only)
-        ei = 0
-        for m in range(1, self.k):
-            if m == miss: continue
-            E_m = self.E(e_idx_list[ei]); ei += 1
-            pm = phys_letters[m]
-            eqa = f"{sub},z{pm}->{sub.replace(pm, '')}"
-            #print(f"[4.{m}] Absorb E{m}: E.shape={tuple(E_m.shape)}  einsum='{eqa}'")
-            E_m = self.bne(E_m)
-            E_m = self.input_dropout(E_m)
-            T = torch.einsum(eqa, T, E_m)
-            sub = sub.replace(pm, '')
-            #print(f"[4.{m}] → T.shape={tuple(T.shape)}, sub='{sub}'")
-
-        # 4) fuse missing core + collapse
+        # Step3: Fuse missing core
+        start = time.time()
         Gm = self.cores[miss]
         pm = phys_letters[miss]
         bm = [bond_letters[e] for e in self.edges if miss in e]
         eqm = f"{sub},{''.join(bm)+pm}->{sub+pm}"
-        #print(f"[5] Fuse missing G{miss}: shape={tuple(Gm.shape)}  einsum='{eqm}'")
         T = torch.einsum(eqm, T, Gm)
+        mem3 = torch.cuda.max_memory_allocated()/1024**2
+        logging.info(f"Step3 fuse missing core: time={time.time()-start:.4f}s, mem={mem3:.1f}MiB")
         sub += pm
-        #print(f"[5] → T.shape={tuple(T.shape)}, sub='{sub}'")
 
-        # collapse all bond dims
-        S = T
-        for _ in range(S.dim()-2):
-            S = S.sum(dim=1)
-        #print(f"[6] After collapse S.shape={tuple(S.shape)}")
+        # Step4: Collapse all bond dims at once
+        start = time.time()
+        S = T.sum(dim=tuple(range(1, T.dim()-1)))  # (B, c_m)
+        mem4 = torch.cuda.max_memory_allocated()/1024**2
+        logging.info(f"Step4 collapse bonds: time={time.time()-start:.4f}s, mem={mem4:.1f}MiB")
 
-        # final BN+dropout+softmax
-        out = self.bnw(S)
-        out = self.hidden_dropout(out)
+        # Step5: Final BN, dropout, softmax
+        start = time.time()
+        out = self.hidden_dropout(self.bnw(S))
         logits = out @ self.E.weight.t()
-        return F.softmax(logits, dim=1), W
+        pred = F.softmax(logits, dim=1)
+        #pred = pred.clamp(min=1e-7, max=1-1e-7)
+        mem5 = torch.cuda.max_memory_allocated()/1024**2
+        logging.info(f"Step5 final layers: time={time.time()-start:.4f}s, mem={mem5:.1f}MiB")
 
-    # def forward(self, r_idx, e_idx_list, miss_ent_domain, W=None):
-    #     """
-    #     r_idx:           (B,)   relation indices
-    #     e_idx_list:      list of (k-2) tensors each (B,) for the known entities
-    #     miss_ent_domain: int ∈ [1..k-1]
-    #     """
-    #     B = r_idx.size(0)
-    #     #print(f"\n[DEBUG] B={B}, missing mode={miss_ent_domain}")
-    #     # 1) embed relation
-    #     r = self.R(r_idx)         # (B, d_r)
-    #     #print(f"[1] r.shape = {tuple(r.shape)}")
-    #     r = self.bnr(r)
-    #     r = self.input_dropout(r)
+        return logits, W
 
-    #     # letter assignment for einsum
-    #     bond_letters = {e: chr(ord('a')+i) for i,e in enumerate(self.edges)}
-    #     phys_letters = [chr(ord('i')+m) for m in range(self.k)]
 
-    #     # 2) fuse relation into core G₀
-    #     G0 = self.cores[0]
-    #     p0    = phys_letters[0]
-    #     bonds0= [bond_letters[e] for e in self.edges if 0 in e]
-    #     eq0   = f"z{p0},{''.join(bonds0)+p0}->z{''.join(bonds0)}"
-    #     #print(f"[2] Fuse G0: G0.shape={tuple(G0.shape)}, einsum='{eq0}'")
-    #     T     = torch.einsum(eq0, r, G0)
-    #     sub_T = 'z' + ''.join(bonds0)
-    #     #print(f"[2] T.shape={tuple(T.shape)}, sub_T='{sub_T}'")
-    #     # 3) fuse & absorb all non‑missing entity cores
-    #     idx_known = 0
-    #     for mode in range(1, self.k):
-    #         if mode == miss_ent_domain:
-    #             continue
+# class GETD_FC(nn.Module):
+#     """
+#     Fully-connected Tensor-Ring GETD model with on-the-fly contraction.
 
-    #         # fuse core G_mode
-    #         Gm = self.cores[mode]
-    #         pm = phys_letters[mode]
-    #         bonds_m = [bond_letters[e] for e in self.edges if mode in e]
-    #         eq_f = f"{sub_T},{''.join(bonds_m)+pm}->{sub_T+pm}"
-    #         #print(f"[3.{mode}] Fuse G{mode}: G.shape={tuple(Gm.shape)}, einsum='{eq_f}'")
-    #         T   = torch.einsum(eq_f, T, Gm)
-    #         #print(f"[3.{mode}] After fuse, T.shape={tuple(T.shape)}")
-    #         # absorb known entity embedding
-    #         e = self.E(e_idx_list[idx_known]);  idx_known += 1
-    #         e = self.bne(e)
-    #         e = self.input_dropout(e)
-    #         eq_a = f"{sub_T+pm},z{pm}->{sub_T}"
-    #         #print(f"[3.{mode}] Absorb e{mode}: e.shape={tuple(e.shape)}, einsum='{eq_a}'")
-    #         T   = torch.einsum(eq_a, T, e)
-    #         #print(f"[3.{mode}] After absorb, T.shape={tuple(T.shape)}")
-    #     # 4) now project into the missing mode
-    #     # fuse missing core
-    #     Gm = self.cores[miss_ent_domain]
-    #     pm = phys_letters[miss_ent_domain]
-    #     bonds_m = [bond_letters[e] for e in self.edges if miss_ent_domain in e]
-    #     eq_fm = f"{sub_T},{''.join(bonds_m)+pm}->{sub_T+pm}"
-    #     #print(f"[4] Fuse missing G{miss_ent_domain}: G.shape={tuple(Gm.shape)}, einsum='{eq_fm}'")
-    #     T    = torch.einsum(eq_fm, T, Gm)
-    #     #print(f"[4] After missing fuse, T.shape={tuple(T.shape)}")
-    #     # collapse all bond dims → S[b, i_miss]
-    #     S = T
-    #     for _ in range(S.dim()-2):
-    #         S = S.sum(dim=1)
-    #     #print(f"[4] After collapse, S.shape={tuple(S.shape)}")
-    #     # final prediction
-    #     out    = self.bnw(S)
-    #     out    = self.hidden_dropout(out)
-    #     logits = out @ self.E.weight.t()     # (B, n_entities)
-    #     return F.softmax(logits, dim=1), W
+#     Modes: 0 = relation, 1..k-1 = entities (k total modes).
+#     Cores: one per mode, each tensor shaped by bond dimensions and a physical dimension.
+#     """
+#     def __init__(self, data, d_e, d_r, ni_list, rank_list, device, **kwargs): 
+#         super().__init__()
+#         self.k = len(ni_list)
+#         assert self.k >= 2, "Need at least relation + entities"
+#         assert len(rank_list) == self.k*(self.k-1)//2, \
+#             f"need {self.k*(self.k-1)//2} bond ranks, got {len(rank_list)}"
+#         # Precompute edges and bond ranks
+#         self.edges = list(combinations(range(self.k), 2))
+#         self.bond_ranks = {edge: rank_list[i] for i, edge in enumerate(self.edges)}
+#         self.ni_list = ni_list
+#         # Embeddings
+
+#         self.E = torch.nn.Embedding(len(data.entities), embedding_dim=d_e, padding_idx=0)
+#         self.R = torch.nn.Embedding(len(data.relations), embedding_dim=d_r, padding_idx=0)
+        
+#         self.E.weight.data = (1e-3 * torch.randn((len(data.entities), d_e), dtype=torch.float).to(device))
+#         self.R.weight.data = (1e-3 * torch.randn((len(data.relations), d_r), dtype=torch.float).to(device))
+#         # Core tensors
+#         # self.cores = nn.ParameterList()
+#         # for i in range(self.k):
+#         #     shape = []
+#         #     for j in range(self.k):
+#         #         if i == j: continue
+#         #         edge = (i, j) if i < j else (j, i)
+#         #         shape.append(self.bond_ranks[edge])
+#         #     shape.append(self.ni_list[i])
+#         #     G = nn.Parameter(torch.randn(*shape, device=device) * 1e-2)
+            
+#         #     self.cores.append(G)
+            
+            
+#         # Core tensors
+#         self.cores = torch.nn.ParameterList()
+#         for i in range(self.k):
+#             shape = []
+#             for j in range(self.k):
+#                 if i == j:
+#                     continue
+#                 edge = (i, j) if i < j else (j, i)
+#                 shape.append(self.bond_ranks[edge])
+#             shape.append(self.ni_list[i])
+#             # initialize with numpy uniform of shape tuple
+#             size_tuple = tuple(shape)
+#             G = torch.nn.Parameter(
+#                 torch.tensor(
+#                     np.random.uniform(-1e-1, 1e-1, size_tuple),
+#                     dtype=torch.float,
+#                     requires_grad=True
+#                 ).to(device)
+#             )
+#             self.cores.append(G)
+#         # Norms & dropout
+        
+#         self.bnr = nn.BatchNorm1d(d_r)
+#         self.bne = nn.BatchNorm1d(d_e)
+#         self.bnw = nn.BatchNorm1d(d_e)
+#         self.input_dropout  = nn.Dropout(kwargs.get("input_dropout", 0.0))
+#         self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout", 0.0))
+#         self.loss = MyLoss()
+        
+#     def forward(self, r_idx, e_idx_list, miss, W=None):
+#         B = r_idx.size(0)
+#         #print(f"\n=== RUN miss={miss}  batch={B} ===")
+
+#         # subscripts for einsum
+#         bond_letters = {e: chr(ord('a')+i) for i,e in enumerate(self.edges)}
+#         phys_letters = [chr(ord('A')+m) for m in range(self.k)]
+
+#         # 1) embed relation + fuse G0
+#         R0 = self.R(r_idx)
+#         #print(f"[1] R0.shape = {tuple(R0.shape)}")
+#         R0 = self.bnr(R0)
+#         R0 = self.input_dropout(R0)
+#         G0 = self.cores[0]
+#         p0 = phys_letters[0]
+#         b0 = [bond_letters[e] for e in self.edges if 0 in e]
+#         eq0 = f"z{p0},{''.join(b0)+p0}->z{''.join(b0)}"
+#         #print(f"[2] Fuse G0: G0.shape={tuple(G0.shape)}  einsum='{eq0}'")
+#         T = torch.einsum(eq0, R0, G0)
+#         sub = 'z' + ''.join(b0)
+#         #print(f"[2] → T.shape={tuple(T.shape)}, sub='{sub}'")
+
+#         # 2) fuse all non-missing entity cores (keep all bonds)
+#         for m in range(1, self.k):
+#             if m == miss: continue
+#             Gm = self.cores[m]
+#             pm = phys_letters[m]
+#             bm = [bond_letters[e] for e in self.edges if m in e]
+#             eqf = f"{sub},{''.join(bm)+pm}->{sub+pm}"
+#             #print(f"[3.{m}] Fuse G{m}: shape={tuple(Gm.shape)}  einsum='{eqf}'")
+#             T = torch.einsum(eqf, T, Gm)
+#             sub += pm
+#             #print(f"[3.{m}] → T.shape={tuple(T.shape)}, sub='{sub}'")
+
+#         # 3) absorb all non-missing embeddings (collapse phys legs only)
+#         ei = 0
+#         for m in range(1, self.k):
+#             if m == miss: continue
+#             E_m = self.E(e_idx_list[ei]); ei += 1
+#             pm = phys_letters[m]
+#             eqa = f"{sub},z{pm}->{sub.replace(pm, '')}"
+#             #print(f"[4.{m}] Absorb E{m}: E.shape={tuple(E_m.shape)}  einsum='{eqa}'")
+#             E_m = self.bne(E_m)
+#             E_m = self.input_dropout(E_m)
+#             T = torch.einsum(eqa, T, E_m)
+#             sub = sub.replace(pm, '')
+#             #print(f"[4.{m}] → T.shape={tuple(T.shape)}, sub='{sub}'")
+
+#         # 4) fuse missing core + collapse
+#         Gm = self.cores[miss]
+#         pm = phys_letters[miss]
+#         bm = [bond_letters[e] for e in self.edges if miss in e]
+#         eqm = f"{sub},{''.join(bm)+pm}->{sub+pm}"
+#         #print(f"[5] Fuse missing G{miss}: shape={tuple(Gm.shape)}  einsum='{eqm}'")
+#         T = torch.einsum(eqm, T, Gm)
+#         sub += pm
+#         #print(f"[5] → T.shape={tuple(T.shape)}, sub='{sub}'")
+
+#         # collapse all bond dims
+#         S = T
+#         for _ in range(S.dim()-2):
+#             S = S.sum(dim=1)
+#         #print(f"[6] After collapse S.shape={tuple(S.shape)}")
+
+#         # final BN+dropout+softmax
+#         out = self.bnw(S)
+#         out = self.hidden_dropout(out)
+#         logits = out @ self.E.weight.t()
+#         return F.softmax(logits, dim=1), W
+
+#     # def forward(self, r_idx, e_idx_list, miss_ent_domain, W=None): ##doesn't save legs to missed one
+#     #     """
+#     #     r_idx:           (B,)   relation indices
+#     #     e_idx_list:      list of (k-2) tensors each (B,) for the known entities
+#     #     miss_ent_domain: int ∈ [1..k-1]
+#     #     """
+#     #     B = r_idx.size(0)
+#     #     #print(f"\n[DEBUG] B={B}, missing mode={miss_ent_domain}")
+#     #     # 1) embed relation
+#     #     r = self.R(r_idx)         # (B, d_r)
+#     #     #print(f"[1] r.shape = {tuple(r.shape)}")
+#     #     r = self.bnr(r)
+#     #     r = self.input_dropout(r)
+
+#     #     # letter assignment for einsum
+#     #     bond_letters = {e: chr(ord('a')+i) for i,e in enumerate(self.edges)}
+#     #     phys_letters = [chr(ord('i')+m) for m in range(self.k)]
+
+#     #     # 2) fuse relation into core G₀
+#     #     G0 = self.cores[0]
+#     #     p0    = phys_letters[0]
+#     #     bonds0= [bond_letters[e] for e in self.edges if 0 in e]
+#     #     eq0   = f"z{p0},{''.join(bonds0)+p0}->z{''.join(bonds0)}"
+#     #     #print(f"[2] Fuse G0: G0.shape={tuple(G0.shape)}, einsum='{eq0}'")
+#     #     T     = torch.einsum(eq0, r, G0)
+#     #     sub_T = 'z' + ''.join(bonds0)
+#     #     #print(f"[2] T.shape={tuple(T.shape)}, sub_T='{sub_T}'")
+#     #     # 3) fuse & absorb all non‑missing entity cores
+#     #     idx_known = 0
+#     #     for mode in range(1, self.k):
+#     #         if mode == miss_ent_domain:
+#     #             continue
+
+#     #         # fuse core G_mode
+#     #         Gm = self.cores[mode]
+#     #         pm = phys_letters[mode]
+#     #         bonds_m = [bond_letters[e] for e in self.edges if mode in e]
+#     #         eq_f = f"{sub_T},{''.join(bonds_m)+pm}->{sub_T+pm}"
+#     #         #print(f"[3.{mode}] Fuse G{mode}: G.shape={tuple(Gm.shape)}, einsum='{eq_f}'")
+#     #         T   = torch.einsum(eq_f, T, Gm)
+#     #         #print(f"[3.{mode}] After fuse, T.shape={tuple(T.shape)}")
+#     #         # absorb known entity embedding
+#     #         e = self.E(e_idx_list[idx_known]);  idx_known += 1
+#     #         e = self.bne(e)
+#     #         e = self.input_dropout(e)
+#     #         eq_a = f"{sub_T+pm},z{pm}->{sub_T}"
+#     #         #print(f"[3.{mode}] Absorb e{mode}: e.shape={tuple(e.shape)}, einsum='{eq_a}'")
+#     #         T   = torch.einsum(eq_a, T, e)
+#     #         #print(f"[3.{mode}] After absorb, T.shape={tuple(T.shape)}")
+#     #     # 4) now project into the missing mode
+#     #     # fuse missing core
+#     #     Gm = self.cores[miss_ent_domain]
+#     #     pm = phys_letters[miss_ent_domain]
+#     #     bonds_m = [bond_letters[e] for e in self.edges if miss_ent_domain in e]
+#     #     eq_fm = f"{sub_T},{''.join(bonds_m)+pm}->{sub_T+pm}"
+#     #     #print(f"[4] Fuse missing G{miss_ent_domain}: G.shape={tuple(Gm.shape)}, einsum='{eq_fm}'")
+#     #     T    = torch.einsum(eq_fm, T, Gm)
+#     #     #print(f"[4] After missing fuse, T.shape={tuple(T.shape)}")
+#     #     # collapse all bond dims → S[b, i_miss]
+#     #     S = T
+#     #     for _ in range(S.dim()-2):
+#     #         S = S.sum(dim=1)
+#     #     #print(f"[4] After collapse, S.shape={tuple(S.shape)}")
+#     #     # final prediction
+#     #     out    = self.bnw(S)
+#     #     out    = self.hidden_dropout(out)
+#     #     logits = out @ self.E.weight.t()     # (B, n_entities)
+#     #     return F.softmax(logits, dim=1), W
 
 # class GETD_FC(nn.Module):
         

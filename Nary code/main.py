@@ -186,7 +186,9 @@ class Experiment:
 
         model = model.to(device)
 
-        opt = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
+        #opt = torch.optim.Adam(model.parameters(), lr=self.learning_rate) #optimizing FC
+        opt = torch.optim.AdamW(model.parameters(), lr=self.learning_rate, weight_decay=1e-4)
+
         if self.decay_rate:
             scheduler = ExponentialLR(opt, self.decay_rate)
 
@@ -238,12 +240,18 @@ class Experiment:
                     # num_columns = data_batch.shape[1]
                     # e_idx = [torch.tensor(data_batch[:, i], dtype=torch.long).to(device) for i in range(1, num_columns)]
                     
-
-
-                    pred, W = model.forward(r_idx, e_idx, miss_ent_domain)
-                    pred = pred.to(device)
-                    loss = model.loss(pred, label)
+                    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+                    logits, W = model(r_idx, e_idx, miss_ent_domain)
+                    # `label` must be a LongTensor of shape (B,) containing the index of the true entity
+                    loss = criterion(logits, label)
                     loss.backward()
+                   
+                    # pred, W = model.forward(r_idx, e_idx, miss_ent_domain)
+                    # pred = pred.to(device)
+                    # loss = model.loss(pred, label)
+                    # loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) #optimizing FC
+
                     opt.step()
                     torch.cuda.empty_cache()
                     losses.append(loss.item())
