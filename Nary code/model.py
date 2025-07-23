@@ -536,6 +536,276 @@ class GETD_HT3_Enhanced(nn.Module):
         pred = F.softmax(x, dim=1)
         return pred, W
 
+import time
+import logging
+from itertools import combinations
+
+import time
+import logging
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from itertools import combinations
+
+class GETD_FC_opt_pos(nn.Module):
+    """
+    Fully-connected GETD model with on-the-fly contraction,
+    optimized bond collapse, combined core+embed, profiling,
+    and position-aware entity embeddings.
+    Caches einsum equation strings to avoid runtime re-parsing.
+    Profiling messages are written to 'profiling.log'.
+    """
+    def __init__(self, data, d_e, d_r, ni_list, rank_list, device, **kwargs):
+        super().__init__()
+        self.k = len(ni_list)
+        assert self.k >= 2, "Need at least relation + entities"
+        # Precompute edges and bond ranks
+        self.edges = list(combinations(range(self.k), 2))
+        self.bond_ranks = {edge: rank_list[i] for i, edge in enumerate(self.edges)}
+        self.ni_list = ni_list
+
+        # Embeddings
+        self.E = nn.Embedding(len(data.entities), d_e, padding_idx=0).to(device)
+        self.R = nn.Embedding(len(data.relations), d_r, padding_idx=0).to(device)
+        # Random init
+        self.E.weight.data = 1e-3 * torch.randn_like(self.E.weight)
+        self.R.weight.data = 1e-3 * torch.randn_like(self.R.weight)
+
+        # Position embeddings for each slot
+        self.position = nn.Parameter(torch.randn(self.k, d_e) * 0.1)
+
+        # Core tensors
+        self.cores = nn.ParameterList()
+        for i in range(self.k):
+            shape = []
+            for j in range(self.k):
+                if i == j:
+                    continue
+                edge = (i, j) if i < j else (j, i)
+                shape.append(self.bond_ranks[edge])
+            shape.append(self.ni_list[i])
+            G = nn.Parameter(
+                torch.tensor(
+                    np.random.uniform(-1e-1, 1e-1, tuple(shape)),
+                    dtype=torch.float,
+                    device=device
+                )
+            )
+            self.cores.append(G)
+
+        # Norms & dropout
+        self.bnr = nn.BatchNorm1d(d_r)
+        self.bne = nn.BatchNorm1d(d_e)
+        self.bnw = nn.BatchNorm1d(d_e)
+        self.input_dropout  = nn.Dropout(kwargs.get("input_dropout", 0.0))
+        self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout", 0.0))
+
+        # Precompute einsum equations
+        phys_letters = [chr(ord('A') + i) for i in range(self.k)]
+        bond_letters = {e: chr(ord('a') + idx) for idx, e in enumerate(self.edges)}
+
+        # Step1: fuse relation into core0
+        p0 = phys_letters[0]
+        b0 = [bond_letters[e] for e in self.edges if 0 in e]
+        self.eq_fuse_rel = f"z{p0},{''.join(b0)+p0}->z{''.join(b0)}"
+
+        # Step2: absorb known entities into T
+        sub = 'z' + ''.join(b0)
+        self.eq_absorb = {}
+        for m in range(1, self.k):
+            bm = [bond_letters[e] for e in self.edges if m in e]
+            pm = phys_letters[m]
+            eq = f"{sub},{''.join(bm)+pm},z{pm}->{sub}"
+            self.eq_absorb[m] = eq
+
+        # Step3: fuse missing core
+        self.eq_missing = {}
+        for m in range(1, self.k):
+            bm = [bond_letters[e] for e in self.edges if m in e]
+            pm = phys_letters[m]
+            self.eq_missing[m] = f"{sub},{''.join(bm)+pm}->{sub+pm}"
+
+    def forward(self, r_idx, e_idx_list, miss, W=None):
+        torch.cuda.reset_peak_memory_stats()
+        B = r_idx.size(0)
+
+        # Step1: fuse relation
+        start = time.time()
+        R0 = self.input_dropout(self.bnr(self.R(r_idx)))  # (B, d_r)
+        T = torch.einsum(self.eq_fuse_rel, R0, self.cores[0])
+        mem1 = torch.cuda.max_memory_allocated() / 1024**2
+        logging.info(f"Step1 fuse relation: time={time.time()-start:.4f}s, mem={mem1:.1f}MiB")
+
+        # Step2: absorb known entities
+        start = time.time()
+        idx_known = 0
+        for m in range(1, self.k):
+            if m == miss:
+                continue
+            Em = self.E(e_idx_list[idx_known])  # (B, d_e)
+            # add position embedding for slot m
+            Em = Em + self.position[m]
+            Em = self.input_dropout(self.bne(Em))
+            eq = self.eq_absorb[m]
+            T = torch.einsum(eq, T, self.cores[m], Em)
+            idx_known += 1
+        mem2 = torch.cuda.max_memory_allocated() / 1024**2
+        logging.info(f"Step2 fuse+absorb entities: time={time.time()-start:.4f}s, mem={mem2:.1f}MiB")
+
+        # Step3: fuse missing core
+        start = time.time()
+        eqm = self.eq_missing[miss]
+        T = torch.einsum(eqm, T, self.cores[miss])
+        mem3 = torch.cuda.max_memory_allocated() / 1024**2
+        logging.info(f"Step3 fuse missing core: time={time.time()-start:.4f}s, mem={mem3:.1f}MiB")
+
+        # Step4: collapse bonds
+        start = time.time()
+        S = T.sum(dim=tuple(range(1, T.dim()-1)))  # (B, n_i[miss])
+        mem4 = torch.cuda.max_memory_allocated() / 1024**2
+        logging.info(f"Step4 collapse bonds: time={time.time()-start:.4f}s, mem={mem4:.1f}MiB")
+
+        # Step5: final BN, dropout, projection and score
+        start = time.time()
+        # add position embedding for missing slot before BN
+        S = S + self.position[miss]
+        out = self.hidden_dropout(self.bnw(S))  # (B, d_e)
+        logits = out @ self.E.weight.t()         # (B, num_entities)
+        mem5 = torch.cuda.max_memory_allocated() / 1024**2
+        logging.info(f"Step5 final layers: time={time.time()-start:.4f}s, mem={mem5:.1f}MiB")
+
+        return logits, W
+
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GETD_FC_opt(nn.Module):
+    """
+    Fully-connected GETD model with on-the-fly contraction,
+    optimized bond collapse, combined core+embed, and profiling.
+    Caches einsum equation strings to avoid runtime re-parsing.
+    Profiling messages are written to 'profiling.log'.
+    """
+    def __init__(self, data, d_e, d_r, ni_list, rank_list, device, **kwargs):
+        super().__init__()
+        self.k = len(ni_list)
+        assert self.k >= 2, "Need at least relation + entities"
+        # Precompute edges and bond ranks
+        self.edges = list(combinations(range(self.k), 2))
+        self.bond_ranks = {edge: rank_list[i] for i, edge in enumerate(self.edges)}
+        self.ni_list = ni_list
+
+        # Embeddings
+        self.E = nn.Embedding(len(data.entities), d_e, padding_idx=0).to(device)
+        self.R = nn.Embedding(len(data.relations), d_r, padding_idx=0).to(device)
+        # Random init
+        self.E.weight.data = 1e-3 * torch.randn_like(self.E.weight)
+        self.R.weight.data = 1e-3 * torch.randn_like(self.R.weight)
+
+        # Core tensors
+        self.cores = nn.ParameterList()
+        for i in range(self.k):
+            shape = []
+            for j in range(self.k):
+                if i == j:
+                    continue
+                edge = (i, j) if i < j else (j, i)
+                shape.append(self.bond_ranks[edge])
+            shape.append(self.ni_list[i])
+            G = nn.Parameter(
+                torch.tensor(
+                    np.random.uniform(-1e-1, 1e-1, tuple(shape)),
+                    dtype=torch.float,
+                    device=device
+                )
+            )
+            self.cores.append(G)
+
+        # Norms & dropout
+        self.bnr = nn.BatchNorm1d(d_r)
+        self.bne = nn.BatchNorm1d(d_e)
+        self.bnw = nn.BatchNorm1d(d_e)
+        self.input_dropout  = nn.Dropout(kwargs.get("input_dropout", 0.0))
+        self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout", 0.0))
+
+        # LOSS placeholder
+        # self.loss = MyLoss()
+
+        # Precompute einsum equations
+        phys_letters = [chr(ord('A') + i) for i in range(self.k)]
+        bond_letters = {e: chr(ord('a') + idx) for idx, e in enumerate(self.edges)}
+
+        # Step1: fuse relation into core0
+        p0 = phys_letters[0]
+        b0 = [bond_letters[e] for e in self.edges if 0 in e]
+        self.eq_fuse_rel = f"z{p0},{''.join(b0)+p0}->z{''.join(b0)}"
+
+        # Step2: absorb known entities into T
+        sub = 'z' + ''.join(b0)
+        self.eq_absorb = {}
+        for m in range(1, self.k):
+            bm = [bond_letters[e] for e in self.edges if m in e]
+            pm = phys_letters[m]
+            eq = f"{sub},{''.join(bm)+pm},z{pm}->{sub}"
+            self.eq_absorb[m] = eq
+
+        # Step3: fuse missing core
+        self.eq_missing = {}
+        for m in range(1, self.k):
+            bm = [bond_letters[e] for e in self.edges if m in e]
+            pm = phys_letters[m]
+            self.eq_missing[m] = f"{sub},{''.join(bm)+pm}->{sub+pm}"
+
+    def forward(self, r_idx, e_idx_list, miss, W=None):
+        torch.cuda.reset_peak_memory_stats()
+        B = r_idx.size(0)
+
+        # Step1: fuse relation
+        start = time.time()
+        R0 = self.input_dropout(self.bnr(self.R(r_idx)))  # (B, d_r)
+        T = torch.einsum(self.eq_fuse_rel, R0, self.cores[0])
+        mem1 = torch.cuda.max_memory_allocated() / 1024**2
+        logging.info(f"Step1 fuse relation: time={time.time()-start:.4f}s, mem={mem1:.1f}MiB")
+        sub = None  # not needed further
+
+        # Step2: absorb known entities
+        start = time.time()
+        idx_known = 0
+        for m in range(1, self.k):
+            if m == miss:
+                continue
+            Em = self.input_dropout(self.bne(self.E(e_idx_list[idx_known])))  # (B, d_e)
+            eq = self.eq_absorb[m]
+            T = torch.einsum(eq, T, self.cores[m], Em)
+            idx_known += 1
+        mem2 = torch.cuda.max_memory_allocated() / 1024**2
+        logging.info(f"Step2 fuse+absorb entities: time={time.time()-start:.4f}s, mem={mem2:.1f}MiB")
+
+        # Step3: fuse missing core
+        start = time.time()
+        eqm = self.eq_missing[miss]
+        T = torch.einsum(eqm, T, self.cores[miss])
+        mem3 = torch.cuda.max_memory_allocated() / 1024**2
+        logging.info(f"Step3 fuse missing core: time={time.time()-start:.4f}s, mem={mem3:.1f}MiB")
+
+        # Step4: collapse bonds
+        start = time.time()
+        S = T.sum(dim=tuple(range(1, T.dim()-1)))  # (B, n_i[miss])
+        mem4 = torch.cuda.max_memory_allocated() / 1024**2
+        logging.info(f"Step4 collapse bonds: time={time.time()-start:.4f}s, mem={mem4:.1f}MiB")
+
+        # Step5: final BN, dropout, softmax
+        start = time.time()
+        out = self.hidden_dropout(self.bnw(S))  # (B, d_e)
+        logits = out @ self.E.weight.t()         # (B, num_entities)
+        mem5 = torch.cuda.max_memory_allocated() / 1024**2
+        logging.info(f"Step5 final layers: time={time.time()-start:.4f}s, mem={mem5:.1f}MiB")
+
+        return logits, W
 
 class GETD_HT3(nn.Module):
     def __init__(self, d, d_e, d_r, k, ni_list, ranks, device, **kwargs):
@@ -847,98 +1117,131 @@ class GETD_HT(nn.Module):
 
         return pred, W
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+class GETD_FC_pos(nn.Module):
+    """
+    Pure-FC tensor decomposition, star topology, position/role/edge gating,
+    with optional auxiliary slot and relation prediction losses.
+    Supports k=4 (one relation, 3 entities) with one entity missing (i.e., 2 known entities per query).
+    """
+    def __init__(self, d, edim, rdim, ni_list, rank_list, device,
+                 input_dropout=0.1, hidden_dropout=0.1, use_aux=False, aux_alpha=0.1, aux_beta=0.1):
+        super().__init__()
+        self.device = device
+        self.arity = len(ni_list)
+        self.num_entities = len(d.entities)
+        self.num_relations = len(d.relations)
+        self.edim = edim
+        self.rdim = rdim
+        self.rank = rank_list[0]
+        self.use_aux = use_aux
+        self.aux_alpha = aux_alpha
+        self.aux_beta = aux_beta
 
-class GETD_TT(torch.nn.Module):
-    def __init__(self, d, d_e, d_r, k, ni_list, ranks_list, device, **kwargs):
-        super(GETD_TT, self).__init__()
-
-        assert len(ni_list) == k, "ni_list length should be equal to k"
-        assert len(ranks_list) == k+1, \
-            "In a TT of order k, you must supply k+1 ranks (including the two boundary ranks=1)."
-        assert ranks_list[0] == 1 and ranks_list[-1] == 1, \
-            "In TT, the first and last rank must be 1. Got {}".format(ranks_list)
-
-        self.E = torch.nn.Embedding(len(d.entities), embedding_dim=d_e, padding_idx=0)
-        self.R = torch.nn.Embedding(len(d.relations), embedding_dim=d_r, padding_idx=0)
-        
-        self.E.weight.data = (1e-3 * torch.randn((len(d.entities), d_e), dtype=torch.float).to(device))
-        self.R.weight.data = (1e-3 * torch.randn((len(d.relations), d_r), dtype=torch.float).to(device))
-        
-        # Customizable ni_list per dimension
-        self.Zlist = torch.nn.ParameterList([
-            torch.nn.Parameter(
-                torch.tensor(np.random.uniform(-1e-1, 1e-1, (ranks_list[i], ni_list[i], ranks_list[i+1])),
-                             dtype=torch.float, requires_grad=True).to(device)
-            ) for i in range(k)
+        # Slot-specific entity embeddings
+        self.E = nn.ModuleList([nn.Embedding(self.num_entities, edim) for _ in range(self.arity)])
+        self.R = nn.Embedding(self.num_relations, rdim)
+        self.position = nn.Parameter(torch.randn(self.arity, edim) * 0.1)
+        self.edge_gates = nn.Parameter(torch.zeros(self.arity))
+        self.rank_weights = nn.ParameterList([nn.Parameter(torch.ones(self.rank)) for _ in range(self.arity)])
+        self.C_entity = nn.ParameterList([
+            nn.Parameter(torch.randn(self.rank, edim) * 0.1) for _ in range(self.arity)
         ])
+        # Only (rank, rank, rdim) for arity=4 with one entity missing!
+        self.C_relation = nn.Parameter(torch.randn(self.rank, self.rank, self.rdim) * 0.1)
 
-        self.loss = MyLoss()
-        self.input_dropout = torch.nn.Dropout(kwargs["input_dropout"])
-        self.hidden_dropout = torch.nn.Dropout(kwargs["hidden_dropout"])
-        self.bne = torch.nn.BatchNorm1d(d_e)
-        self.bnr = torch.nn.BatchNorm1d(d_r)
-        self.bnw = torch.nn.BatchNorm1d(d_e)
-        self.ary = len(d.train_data[0]) - 1
+        self.E_pred = nn.Embedding(self.num_entities, edim)
+        self.proj = nn.Linear(edim, rdim, bias=False)
+        self.input_dropout = nn.Dropout(input_dropout)
+        self.hidden_dropout = nn.Dropout(hidden_dropout)
 
-    def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
-        de = self.E.weight.shape[1]
-        dr = self.R.weight.shape[1]
+        # Auxiliary heads for slot and relation prediction
+        if self.use_aux:
+            self.role_heads = nn.ModuleList([nn.Linear(edim, self.arity) for _ in range(self.arity)])
+            self.rel_head = nn.Linear(rdim, self.num_relations)
 
-        if W is None:
-            Zlist = [Z for Z in self.Zlist]
-            k = len(Zlist)
-            einsum_str = None
-            
-            if k == 4:
-                einsum_str = 'aib,bjc,ckd,dlf->ijkl'
-            elif k == 5:
-                einsum_str = 'aib,bjc,ckd,dle,emf->ijklm'
-            else:
-                raise ValueError("TR equation for k={} is not defined.".format(k))
-            
-            W0 = torch.einsum(einsum_str, *Zlist)
-            
-            if self.ary == 3:
-                W = W0.view(dr, de, de, de)
-            elif self.ary == 4:
-                W = W0.view(dr, de, de, de, de)
+    def forward(self, r_idx, e_idx_list, missing_slot, W=None, return_aux=False):
+        """
+        r_idx: (B,)
+        e_idx_list: list of (B,) entity idx, for the 2 known slots (k=4, one missing, so len=2)
+        missing_slot: 1-based index (1 = first entity)
+        Returns logits (B, num_entities), None [, aux_loss if return_aux]
+        """
+        B = r_idx.size(0)
+        arity = self.arity
+        device = r_idx.device
 
-        r = self.bnr(self.R(r_idx))
-        W_mat = torch.mm(r, W.view(r.size(1), -1))
+        # Which entity slots are present? (model expects slots 1..arity-1, missing_slot is not present)
+        entity_slots = [slot for slot in range(1, arity) if slot != missing_slot]
 
-        if self.ary == 3:
-            W_mat = W_mat.view(-1, de, de, de)
-            e2, e3 = self.bne(self.E(e_idx[0])), self.bne(self.E(e_idx[1]))
-            e2, e3 = self.input_dropout(e2), self.input_dropout(e3)
-            if miss_ent_domain == 1:
-                W_mat1 = torch.einsum('ijkl,il,ik->ij', W_mat, e3, e2)
-            elif miss_ent_domain == 2:
-                W_mat1 = torch.einsum('ijkl,il,ij->ik', W_mat, e3, e2)
-            elif miss_ent_domain == 3:
-                W_mat1 = torch.einsum('ijkl,ij,ik->il', W_mat, e2, e3)
+        # Build entity embeddings (+ position + dropout), in correct slot order
+        e_vecs = []
+        role_logits = []
+        for i, slot in enumerate(entity_slots):
+            e = self.E[slot](e_idx_list[i]) + self.position[slot]
+            e = self.input_dropout(e)
+            e_vecs.append(e)
+            if self.use_aux:
+                role_logits.append(self.role_heads[slot](e))
 
-        elif self.ary == 4:
-            W_mat = W_mat.view(-1, de, de, de, de)
-            e2, e3, e4 = [self.bne(self.E(e_idx[i])) for i in range(3)]
-            e2, e3, e4 = [self.input_dropout(e) for e in (e2, e3, e4)]
+        # Relation embedding
+        r = self.R(r_idx)
+        r = self.input_dropout(r)
+        if self.use_aux:
+            rel_logits = self.rel_head(r)
 
-            if miss_ent_domain == 1:
-                W_mat1 = torch.einsum('ijklm,il,ik,im->ij', W_mat, e3, e2, e4)
-            elif miss_ent_domain == 2:
-                W_mat1 = torch.einsum('ijklm,il,ij,im->ik', W_mat, e3, e2, e4)
-            elif miss_ent_domain == 3:
-                W_mat1 = torch.einsum('ijklm,ij,ik,im->il', W_mat, e2, e3, e4)
-            elif miss_ent_domain == 4:
-                W_mat1 = torch.einsum('ijklm,ij,ik,il->im', W_mat, e2, e3, e4)
+        # Contract with entity cores, apply gate/weights
+        H = []
+        for idx, slot in enumerate(entity_slots):
+            g = torch.sigmoid(self.edge_gates[slot])
+            w = F.softmax(self.rank_weights[slot], dim=0)
+            C = self.C_entity[slot] * w[:, None]
+            C = g * C
+            h = torch.matmul(e_vecs[idx], C.T)
+            H.append(h)  # Each (B, rank)
 
-        W_mat1 = self.bnw(W_mat1)
-        W_mat1 = self.hidden_dropout(W_mat1)
-        x = torch.mm(W_mat1, self.E.weight.transpose(1, 0))
+        # Main link prediction (over all entities in missing slot)
+        logits = []
+        for ent in range(self.num_entities):
+            # Candidate for missing slot
+            e_cand = self.E[missing_slot](
+                torch.full((B,), ent, dtype=torch.long, device=device)
+            ) + self.position[missing_slot]
+            e_cand = self.input_dropout(e_cand)
+            # Contract: build h_list, placing candidate in the missing slot's position
+            h_list = []
+            h_slot_iter = iter(H)
+            for slot in range(1, arity):
+                if slot == missing_slot:
+                    g = torch.sigmoid(self.edge_gates[slot])
+                    w = F.softmax(self.rank_weights[slot], dim=0)
+                    C = self.C_entity[slot] * w[:, None]
+                    C = g * C
+                    h = torch.matmul(e_cand, C.T)
+                    h_list.append(h)
+                else:
+                    h_list.append(next(h_slot_iter))
+            # For arity=4 with 2 known entities, always do: 'bi,bj,ijk->bk'
+            result = torch.einsum('bi,bj,ijk->bk', h_list[0], h_list[1], self.C_relation)
+            # Fuse with relation embedding
+            score = (result * r).sum(dim=1)  # (B,)
+            logits.append(score)
+        logits = torch.stack(logits, dim=1)  # (B, num_entities)
 
-        pred = F.softmax(x, dim=1)
+        # Auxiliary loss if requested
+        if self.use_aux and return_aux:
+            # Dummy targets for now (replace with real if available)
+            true_roles = torch.zeros((B, arity-1), dtype=torch.long, device=device)
+            true_rel = torch.zeros(B, dtype=torch.long, device=device)
+            role_loss = sum(F.cross_entropy(role_logits[i], true_roles[:, entity_slots[i]-1]) for i in range(len(entity_slots)))
+            rel_loss = F.cross_entropy(rel_logits, true_rel)
+            aux_loss = self.aux_alpha * role_loss + self.aux_beta * rel_loss
+            return logits, None, aux_loss
 
-        return pred, W
+        return logits, None
 
 import torch
 import torch.nn as nn
@@ -1010,9 +1313,9 @@ class GETD_FC(nn.Module):
             )
             self.cores.append(G)
             
-            for G in self.cores:
-                if G.dim() > 1:
-                    init.xavier_uniform_(G)
+            # for G in self.cores:
+            #     if G.dim() > 1:
+            #         init.xavier_uniform_(G)
 
 
         # Norms & dropout

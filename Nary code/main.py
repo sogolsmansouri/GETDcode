@@ -154,12 +154,19 @@ class Experiment:
              hidden_dropout=args.hidden_dropout)
         elif args.method == 'FC':
             #model = GETD(d, args.edim, args.rdim, args.k, args.n_i, args.TR_ranks, device, input_dropout=args.input_dropout, hidden_dropout=args.hidden_dropout)
-            model = GETD_FC(d, args.edim, args.rdim, args.ni_list, args.rank_list, device,
+            model = GETD_FC_opt(d, args.edim, args.rdim, args.ni_list, args.rank_list, device,
              input_dropout=args.input_dropout,
              hidden_dropout=args.hidden_dropout)
-            print("Edges:", model.edges)
-            for i, G in enumerate(model.cores):
-                print(f" Core {i}: shape = {tuple(G.shape)}")
+            # model = GETD_FC_pos(
+            #     d, args.edim, args.rdim, args.ni_list, args.rank_list, device,
+            #     input_dropout=args.input_dropout, hidden_dropout=args.hidden_dropout,
+            #     use_aux=True  # ENABLE AUXILIARY LOSSES!
+            # )
+
+            # print("Edges:", model.edges)
+            # for i, G in enumerate(model.cores):
+            #     print(f" Core {i}: shape = {tuple(G.shape)}")
+            
         # elif args.method == 'HT':
         #     model = GETD_HT3(d, args.edim, args.rdim, args.k, args.ni_list, args.TR_ranks, device, input_dropout=args.input_dropout, hidden_dropout=args.hidden_dropout)
         
@@ -308,12 +315,12 @@ if __name__ == '__main__':
                     help='List of rank values per dimension (length=k+1)')
     parser.add_argument("--TR_ranks", type=int, default=40, nargs="?", help="TR-ranks")
     parser.add_argument("--method", choices=['TR', 'HT', 'TT', 'HT_ENHANCED', 'FC'], default='TR', help="Tensor decomposition method (TR or HT)")
-    parser.add_argument("--ht_tree", type=str, choices=["A","C"], default="A",
-                    help="HT tree config for arity=3: 'A' merges (e1,e2),(e3,rel) first; 'C' merges (e2,e3) first, then e1, then rel.")
-    parser.add_argument("--ht4_tree", type=str, choices=["A", "B", "C"], default="A",
-                    help="HT tree config for arity=3: 'A' merges (e1,e2),(e3,rel) first; 'C' merges (e2,e3) first, then e1, then rel.")
-    parser.add_argument('--ht_ranks', nargs=3, type=int, required=True,
-                    help="HT ranks r1,r2,r3 for the HT3_Enhanced model")
+    # parser.add_argument("--ht_tree", type=str, choices=["A","C"], default="A",
+    #                 help="HT tree config for arity=3: 'A' merges (e1,e2),(e3,rel) first; 'C' merges (e2,e3) first, then e1, then rel.")
+    # parser.add_argument("--ht4_tree", type=str, choices=["A", "B", "C"], default="A",
+    #                 help="HT tree config for arity=3: 'A' merges (e1,e2),(e3,rel) first; 'C' merges (e2,e3) first, then e1, then rel.")
+    # parser.add_argument('--ht_ranks', nargs=3, type=int, required=True,
+    #                 help="HT ranks r1,r2,r3 for the HT3_Enhanced model")
     parser.add_argument(
         '--mlp_hidden',
         type=int,
