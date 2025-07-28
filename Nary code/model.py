@@ -178,6 +178,11 @@ import math
 import torch
 import torch.nn.functional as F
 from itertools import combinations
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class GETD_FC_chunked(nn.Module):
     def __init__(
         self, data, d_e, d_r, ni_list, rank_list,
@@ -189,18 +194,17 @@ class GETD_FC_chunked(nn.Module):
         self.ni_list = ni_list
         self.rank_list = rank_list
 
-        # Embeddings (on CPU initially)
+        # Embeddings (created on CPU to avoid premature GPU OOM)
         self.E = nn.Embedding(len(data.entities), d_e, padding_idx=0)
         self.R = nn.Embedding(len(data.relations), d_r, padding_idx=0)
-        # Batch norms
+        # Batch norms + dropouts
         self.bnr = nn.BatchNorm1d(d_r)
         self.bne = nn.BatchNorm1d(d_e)
         self.bnw = nn.BatchNorm1d(max(ni_list[1:]))
-        # Dropouts
         self.input_dropout = nn.Dropout(p=input_dropout)
         self.hidden_dropout = nn.Dropout(p=hidden_dropout)
 
-        # Initialize the 4 three-way cores as Parameters
+        # Three-way cores (bond-ranks, moved to GPU later)
         n0,n1,n2,n3 = ni_list
         r0,r1,r2,r3,r4,r5 = rank_list
         self.cores = nn.ParameterList([
@@ -210,28 +214,26 @@ class GETD_FC_chunked(nn.Module):
             nn.Parameter(torch.randn(r2, r4, r5, n3)),
         ])
 
-        # Clear any leftover fragmentation, then move the entire model once
+        # Clear leftover cache then move modules & parameters to GPU
         torch.cuda.empty_cache()
         self.to(device)
 
     def forward(self, r_idx, e_idx, miss, W=None):
         device = r_idx.device
         B = r_idx.size(0)
-        # Emb dims
-        de, dr = self.E.embedding_dim, self.R.embedding_dim
-        # Unpack cores and mode sizes
+
+        # Unpack dims & cores
         G0, G1, G2, G3 = self.cores
         n0,n1,n2,n3 = self.ni_list
-        # Bond-ranks for chunking
         i_size, m_size = self.rank_list[0], self.rank_list[5]
 
-        # Helper to split axis into ~chunks slabs
+        # Boundary helper
         def boundaries(n):
             step = math.ceil(n / self.chunks)
             cuts = list(range(0, n, step))
             return cuts + [n]
 
-        # Precompute bounds for each mode and each bond-rank dim
+        # Precompute all slice bounds
         a_bounds = boundaries(n0)
         b_bounds = boundaries(n1)
         c_bounds = boundaries(n2)
@@ -239,16 +241,16 @@ class GETD_FC_chunked(nn.Module):
         i_bounds = boundaries(i_size)
         m_bounds = boundaries(m_size)
 
-        # Compute embeddings with batchnorm+dropout
-        r_emb = self.input_dropout(self.bnr(self.R(r_idx)))
-        e2    = self.input_dropout(self.bne(self.E(e_idx[0])))
-        e3    = self.input_dropout(self.bne(self.E(e_idx[1])))
+        # Embeddings + batchnorm + dropout
+        r_emb = self.input_dropout(self.bnr(self.R(r_idx)))  # (B,dr)
+        e2    = self.input_dropout(self.bne(self.E(e_idx[0])))# (B,de)
+        e3    = self.input_dropout(self.bne(self.E(e_idx[1])))# (B,de)
 
-        # Prepare logits tensor
+        # Prepare logits
         out_size = [n1, n2, n3][miss-1]
         logits   = torch.zeros(B, out_size, device=device)
 
-        # Iterate over mode- and rank-chunk slices
+        # Nested loops: modes + rank-chunks
         for ia in range(len(a_bounds)-1):
             a0,a1 = a_bounds[ia], a_bounds[ia+1]
             G0_a  = G0[..., a0:a1]
@@ -258,7 +260,7 @@ class GETD_FC_chunked(nn.Module):
                 b0,b1 = b_bounds[ib], b_bounds[ib+1]
                 G1_b  = G1[..., b0:b1]
 
-                # Chunk & sum over rank i for K01
+                # Chunk & sum over bond-rank i
                 K01_sum = None
                 for ir in range(len(i_bounds)-1):
                     i0,i1 = i_bounds[ir], i_bounds[ir+1]
@@ -267,6 +269,7 @@ class GETD_FC_chunked(nn.Module):
                         G0_a[i0:i1,...], G1_b[i0:i1,...]
                     )
                     K01_sum = part01 if K01_sum is None else K01_sum + part01
+                    del part01; torch.cuda.empty_cache()
 
                 for ic in range(len(c_bounds)-1):
                     c0,c1 = c_bounds[ic], c_bounds[ic+1]
@@ -276,7 +279,7 @@ class GETD_FC_chunked(nn.Module):
                         d0,d1 = d_bounds[idd], d_bounds[idd+1]
                         G3_d  = G3[..., d0:d1]
 
-                        # Chunk & sum over rank m for K23
+                        # Chunk & sum over bond-rank m
                         K23_sum = None
                         for im in range(len(m_bounds)-1):
                             m0,m1 = m_bounds[im], m_bounds[im+1]
@@ -285,13 +288,17 @@ class GETD_FC_chunked(nn.Module):
                                 G2_c[..., m0:m1,:], G3_d[..., m0:m1,:]
                             )
                             K23_sum = part23 if K23_sum is None else K23_sum + part23
+                            del part23; torch.cuda.empty_cache()
 
-                        # Fuse K01+K23 -> 4D block
+                        # Fuse partial sums -> 4D block
                         block   = torch.einsum('jkanlb,jnckld->abcd', K01_sum, K23_sum)
-                        # Fuse relation embedding
-                        partial = torch.einsum('Ba,abcd->Bbcd', r_sub, block)
+                        del K23_sum; torch.cuda.empty_cache()
 
-                        # Contract known entities into logits
+                        # Fuse relation
+                        partial = torch.einsum('Ba,abcd->Bbcd', r_sub, block)
+                        del block; torch.cuda.empty_cache()
+
+                        # Contract known entities -> logits
                         if miss == 1:
                             ec, ed = e2[:, c0:c1], e3[:, d0:d1]
                             logits[:, b0:b1] += torch.einsum(
@@ -307,11 +314,18 @@ class GETD_FC_chunked(nn.Module):
                             logits[:, d0:d1] += torch.einsum(
                                 'Bbcd,Bb,Bc->Bd', partial, eb, ec
                             )
+                        del partial; torch.cuda.empty_cache()
 
-        # Batchnorm + dropout + final softmax
+                # Clean up K01_sum after using in all c,d
+                del K01_sum; torch.cuda.empty_cache()
+
+        # Final batchnorm + dropout + final projection
         logits = self.hidden_dropout(self.bnw(logits))
         out    = torch.mm(logits, self.E.weight.t())
         pred   = F.softmax(out, dim=1)
+
+        # Cleanup large tensors before returning
+        del G0, G1, G2, G3, r_emb, e2, e3, logits; torch.cuda.empty_cache()
         return pred, W
 
 class GETD_new_FC(torch.nn.Module):
