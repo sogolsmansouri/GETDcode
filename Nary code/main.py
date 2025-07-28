@@ -154,10 +154,10 @@ class Experiment:
              hidden_dropout=args.hidden_dropout)
         elif args.method == 'FC':
             #model = GETD(d, args.edim, args.rdim, args.k, args.n_i, args.TR_ranks, device, input_dropout=args.input_dropout, hidden_dropout=args.hidden_dropout)
-            model = GETD_FC_opt(d, args.edim, args.rdim, args.ni_list, args.rank_list, device,
+            model = GETD_new_FC(d, args.edim, args.rdim, args.ni_list, args.rank_list, device, 15,
              input_dropout=args.input_dropout,
              hidden_dropout=args.hidden_dropout)
-            # model = GETD_FC_pos(
+            # model = GETD_FC_pos(t
             #     d, args.edim, args.rdim, args.ni_list, args.rank_list, device,
             #     input_dropout=args.input_dropout, hidden_dropout=args.hidden_dropout,
             #     use_aux=True  # ENABLE AUXILIARY LOSSES!
@@ -193,13 +193,11 @@ class Experiment:
 
         model = model.to(device)
 
-        #opt = torch.optim.Adam(model.parameters(), lr=self.learning_rate) #optimizing FC
-        opt = torch.optim.AdamW(model.parameters(), lr=self.learning_rate, weight_decay=1e-4)
-
+        opt = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
         if self.decay_rate:
             scheduler = ExponentialLR(opt, self.decay_rate)
 
-        torch.cuda.empty_cache()
+        print("Starting training...")
         best_valid_iter = 0
         best_valid_metric = {'mrr': -1, 'test_mrr': -1, 'test_hit1': -1, 'test_hit3': -1, 'test_hit10': -1}
 
@@ -222,45 +220,22 @@ class Experiment:
 
                 for j in range(0, len(er_vocab_pairs), self.batch_size):
                     data_batch, label = self.get_batch(er_vocab, er_vocab_pairs, j)
-                    
-                    # Save last label row for debug print in forward
-                    model.last_label_row = label[0, :10].cpu().numpy()
                     opt.zero_grad()
-                    # r_idx = torch.tensor(data_batch[:, 0], dtype=torch.long).to(device)
-                    # e1_idx = torch.tensor(data_batch[:, 1], dtype=torch.long).to(device)
-                    # e2_idx = torch.tensor(data_batch[:, 2], dtype=torch.long).to(device)
-                    # print("Sample data_batch shape:", data_batch.shape)
-                    # print("Sample data_batch row:", data_batch[0])
-                    # if ary == 3:
-                    #     e_idx = [e1_idx, e2_idx]
-                    # elif ary == 4:
-                    #     e3_idx = torch.tensor(data_batch[:, 3], dtype=torch.long).to(device)
-                    #     e_idx = [e1_idx, e2_idx, e3_idx]
                     r_idx = torch.tensor(data_batch[:, 0], dtype=torch.long).to(device)
-                    e_idx = [torch.tensor(data_batch[:, i], dtype=torch.long).to(device) for i in range(1, data_batch.shape[1])]
-                    # print("Sample data_batch shape:", data_batch.shape)
-                    # print("Sample data_batch row:", data_batch[0])
+                    e1_idx = torch.tensor(data_batch[:, 1], dtype=torch.long).to(device)
+                    e2_idx = torch.tensor(data_batch[:, 2], dtype=torch.long).to(device)
+                    if ary == 3:
+                        e_idx = [e1_idx, e2_idx]
+                    elif ary == 4:
+                        e3_idx = torch.tensor(data_batch[:, 3], dtype=torch.long).to(device)
+                        e_idx = [e1_idx, e2_idx, e3_idx]
 
-                    
-                    
-                    # r_idx = torch.tensor(data_batch[:, 0], dtype=torch.long).to(device)
-                    # num_columns = data_batch.shape[1]
-                    # e_idx = [torch.tensor(data_batch[:, i], dtype=torch.long).to(device) for i in range(1, num_columns)]
-                    
-                    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
-                    logits, W = model(r_idx, e_idx, miss_ent_domain)
-                    # `label` must be a LongTensor of shape (B,) containing the index of the true entity
-                    loss = criterion(logits, label)
+                    pred, W = model.forward(r_idx, e_idx, miss_ent_domain)
+                    pred = pred.to(device)
+                    loss = model.loss(pred, label)
                     loss.backward()
-                   
-                    # pred, W = model.forward(r_idx, e_idx, miss_ent_domain)
-                    # pred = pred.to(device)
-                    # loss = model.loss(pred, label)
-                    # loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) #optimizing FC
-
                     opt.step()
-                    torch.cuda.empty_cache()
+
                     losses.append(loss.item())
 
             print('\nEpoch %d train, loss=%f' % (it, np.mean(losses, axis=0)))

@@ -23,519 +23,6 @@ class MyLoss(torch.nn.Module):
         return loss
 
 
-class GETD_HT3_Enhanced(nn.Module):
-    """
-    Hierarchical‐Tucker (“HT‐NI”) with:
-      1) Separate HT ranks (r1,r2,r3) instead of forcing r_i = n_i.
-      2) A small two‐layer MLP (with LayerNorm & residual) after the HT contraction,
-         prior to scoring against all entity embeddings.
-      3) Supports both arity=3 and arity=4.
-
-    Constructor args:
-      d         : dataset object, where each d.train_data[i] has length = arity+1
-      d_e       : base entity embedding dim (we will project each entity into its n_i)
-      d_r       : base relation embedding dim (we will project relation into its n_rel)
-      k         : number of modes = (arity + 1)
-      ni_list   : list of k positive ints = [n1, n2, ... , n_k]
-      ht_ranks  : list of 3 positive ints = [r1, r2, r3]
-      device    : "cuda" or "cpu"
-      kwargs    : may contain "input_dropout", "hidden_dropout", "mlp_hidden"
-                  where mlp_hidden is the hidden size of the small MLP (default = max(n_i)//2)
-    """
-    def __init__(self, d, d_e, d_r, k, ni_list, ht_ranks, device, **kwargs):
-        ht_tree = kwargs.pop("ht_tree", "A")
-        ht4_tree = kwargs.pop("ht4_tree", "A")
-        super(GETD_HT3_Enhanced, self).__init__()
-        # — Basic checks —
-        assert len(ni_list) == k, "ni_list length must equal k"
-        self.ary = len(d.train_data[0]) - 1
-        assert self.ary in (3,4), "Supports only arity=3 or arity=4"
-        
-        if self.ary == 3:
-            assert ht_tree in ("A", "C"), "ht_tree must be 'A' or 'C' for arity=3"
-            self.ht_tree = ht_tree
-        else:
-            self.ht_tree = None
-            self.ht4_tree = ht4_tree
-            
-        # — Save dims —
-        self.d_e = d_e
-        self.d_r = d_r
-        self.device = device
-
-        # — Shared embeddings (raw) —
-        self.E = nn.Embedding(len(d.entities), d_e, padding_idx=0)
-        self.R = nn.Embedding(len(d.relations), d_r, padding_idx=0)
-        nn.init.normal_(self.E.weight, 0.0, 1e-3)
-        nn.init.normal_(self.R.weight, 0.0, 1e-3)
-
-        # — Dropout & BatchNorm on raw embeddings —
-        self.input_dropout = torch.nn.Dropout(kwargs["input_dropout"])
-        self.hidden_dropout = torch.nn.Dropout(kwargs["hidden_dropout"])
-        # self.input_dropout  = nn.Dropout(kwargs.get("input_dropout", 0.2))
-        # self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout", 0.2))
-        # batchnorm on HT-MLP output; will initialize once we know n_missing
-        self.bnw = None
-
-        self.bne = nn.BatchNorm1d(d_e)
-        self.bnr = nn.BatchNorm1d(d_r)
-
-        self.loss = MyLoss()
-
-        # — Extract ni_list —
-        if self.ary == 4:
-            # 5 mode sizes: n1,n2,n3,n4,n5
-            n1, n2, n3, n4, n5 = ni_list
-        else:
-            # 4 mode sizes: n1,n2,n3,n4
-            n1, n2, n3, n4 = ni_list
-
-        # — Extract HT ranks (r1,r2,r3) —
-        assert isinstance(ht_ranks, (list,tuple)) and len(ht_ranks) == 3
-        r1, r2, r3 = ht_ranks
-        assert r1>0 and r2>0 and r3>0, "HT ranks must be positive"
-        self.r1, self.r2, self.r3 = r1, r2, r3
-
-        # — Build the small projection layers for each slot —
-        if self.ary == 4:
-            # 4 entity slots + 1 relation = 5 modes
-            self.e1_proj  = nn.Linear(d_e, n1, bias=False)
-            self.e2_proj  = nn.Linear(d_e, n2, bias=False)
-            self.e3_proj  = nn.Linear(d_e, n3, bias=False)
-            self.e4_proj  = nn.Linear(d_e, n4, bias=False)
-            self.rel_proj = nn.Linear(d_r, n5, bias=False)
-
-            # Initialize projection weights
-            for lin in (self.e1_proj, self.e2_proj, self.e3_proj, self.e4_proj, self.rel_proj):
-                nn.init.xavier_uniform_(lin.weight)
-
-            # # — HT cores (arity=4), on CPU initially —
-            # self.ht_left     = nn.Parameter(torch.randn(r1,   n1,    n2) * 1e-1)
-            # self.ht_right    = nn.Parameter(torch.randn(r2,   n3,    n4) * 1e-1)
-            # self.ht_internal = nn.Parameter(torch.randn(r3,   r1,    r2) * 1e-1)
-            # self.ht_root     = nn.Parameter(torch.randn(n5,   r3) * 1e-1)
-            # ――― MODIFIED: 4-ary HT cores depend on ht4_tree ―――
-            if self.ht4_tree == "A":
-                # Tree A (default): (e1,e2)->r1, (e3,e4)->r2, (r1,r2)->r3 -> n5
-                self.ht_left     = nn.Parameter(torch.randn(r1, n1, n2) * 1e-1)
-                self.ht_right    = nn.Parameter(torch.randn(r2, n3, n4) * 1e-1)
-                self.ht_internal = nn.Parameter(torch.randn(r3, r1, r2) * 1e-1)
-                self.ht_root     = nn.Parameter(torch.randn(n5, r3) * 1e-1)
-            elif self.ht4_tree == "C":
-                self.ht_left     = nn.Parameter(torch.randn(r1, n1, n4)*1e-1)  # (e1,e4)
-                self.ht_right    = nn.Parameter(torch.randn(r2, n2, n3)*1e-1)  # (e2,e3)
-                self.ht_internal = nn.Parameter(torch.randn(r3, r1, r2)*1e-1)
-                self.ht_root     = nn.Parameter(torch.randn(n5, r3)*1e-1)
-
-            else:
-                # Tree B: (e1,e3)->r1, (e2,e4)->r2, (r1,r2)->r3 -> n5
-                self.ht_left     = nn.Parameter(torch.randn(r1, n1, n3) * 1e-1)
-                self.ht_right    = nn.Parameter(torch.randn(r2, n2, n4) * 1e-1)
-                self.ht_internal = nn.Parameter(torch.randn(r3, r1, r2) * 1e-1)
-                self.ht_root     = nn.Parameter(torch.randn(n5, r3) * 1e-1)
-
-            # Store mode‐sizes
-            self.n1, self.n2, self.n3, self.n4, self.n5 = n1, n2, n3, n4, n5
-
-        else:
-            # arity=3: 3 entity slots + 1 relation = 4 modes
-            # self.e1_proj  = nn.Linear(d_e, n1, bias=False)
-            # self.e2_proj  = nn.Linear(d_e, n2, bias=False)
-            # self.e3_proj  = nn.Linear(d_e, n3, bias=False)
-            # self.rel_proj = nn.Linear(d_r, n4, bias=False)
-            # for lin in (self.e1_proj, self.e2_proj, self.e3_proj, self.rel_proj):
-            #     nn.init.xavier_uniform_(lin.weight)
-
-            # self.ht_left     = nn.Parameter(torch.randn(r1,   n1,    n2) * 1e-1)
-            # self.ht_right    = nn.Parameter(torch.randn(r2,   n3,    n4) * 1e-1)
-            # self.ht_internal = nn.Parameter(torch.randn(r3,   r1,    r2) * 1e-1)
-
-            # self.n1, self.n2, self.n3, self.n4 = n1, n2, n3, n4
-            # arity=3: 3 entity slots + 1 relation = 4 modes
-            self.e1_proj  = nn.Linear(d_e, n1, bias=False)
-            self.e2_proj  = nn.Linear(d_e, n2, bias=False)
-            self.e3_proj  = nn.Linear(d_e, n3, bias=False)
-            self.rel_proj = nn.Linear(d_r, n4, bias=False)
-            for lin in (self.e1_proj, self.e2_proj, self.e3_proj, self.rel_proj):
-                nn.init.xavier_uniform_(lin.weight)
-
-            if ht_tree == "A":
-                # Tree A: (e1,e2)->r1, (e3,rel)->r2, (r1,r2)->r3
-                self.ht_left     = nn.Parameter(torch.randn(r1, n1, n2) * 1e-1)
-                self.ht_right    = nn.Parameter(torch.randn(r2, n3, n4) * 1e-1)
-                self.ht_internal = nn.Parameter(torch.randn(r3, r1, r2) * 1e-1)
-                self.ht_final_root = None  # no additional layer needed
-            else:
-                # Tree C with true three‐rank structure:
-                self.ht_mid   = nn.Parameter(torch.randn(r1, n2, n3) * 1e-1)
-                self.ht_left  = nn.Parameter(torch.randn(r2, r1, n1) * 1e-1)
-                self.ht_root  = nn.Parameter(torch.randn(r3, r2) * 1e-1)
-                self.ht_final = nn.Parameter(torch.randn(n4, r3) * 1e-1)
-
-            self.n1, self.n2, self.n3, self.n4 = n1, n2, n3, n4
-        # # — Placeholders for the small MLP layers; instantiate in forward() once n_missing is known —
-        
-        self.back_to_de = None
-        self.bn_de     = None
-        self.bn_missing = None
-        # in __init__(), add placeholders:
-        self.back_to_de_1 = None
-        self.bn_de_1      = None
-        self.back_to_de_2 = None
-        self.bn_de_2      = None
-        self.back_to_de_3 = None
-        self.bn_de_3      = None
-
-        # self.mlp_fc1 = None
-        # self.mlp_ln1 = None
-        # self.mlp_fc2 = None
-        # self.mlp_ln2 = None
-        if isinstance(device, torch.device) and device.type == "cuda":
-            self.to(device)
-
-
-    def build_W(self):
-        """
-        Build the HT core tensor W.
-
-        Arity=4 → W shape = [n5, n1, n2, n3, n4].
-        Arity=3 → W shape = [n4, n1, n2, n3].
-        """
-        if self.ary == 4:
-            # # Merge ht_left & ht_right via ht_internal → W_int[c,i,j,k,l]
-            # W_int = torch.einsum(
-            #     'cab, aij, bkl -> cijkl',
-            #     self.ht_internal,  # [r3, r1, r2]
-            #     self.ht_left,      # [r1, n1, n2]
-            #     self.ht_right      # [r2, n3, n4]
-            # )
-            if self.ht4_tree == "A":
-                # (e1,e2)->r1, (e3,e4)->r2
-                # ht_left:  [r1,n1,n2]
-                # ht_right: [r2,n3,n4]
-                # ht_internal: [r3,r1,r2]
-                W_int = torch.einsum(
-                    'cab,aij,bkl->cijkl',
-                    self.ht_internal,
-                    self.ht_left,
-                    self.ht_right
-                )
-            elif self.ht4_tree == "C":
-                W_int = torch.einsum('cab, ail, bjk -> cijkl',
-                                    self.ht_internal,
-                                    self.ht_left,    # [r1,n1,n4]
-                                    self.ht_right)   # [r2,n2,n3]
-
-            else:
-                # (e1,e3)->r1, (e2,e4)->r2
-                # ht_left:  [r1,n1,n3]
-                # ht_right: [r2,n2,n4]
-                # ht_internal: [r3,r1,r2]
-                W_int = torch.einsum(
-                    'cab,aik,bjl->cijkl',
-                    self.ht_internal,
-                    self.ht_left,
-                    self.ht_right
-                )
-            r3, n1, n2, n3, n4 = W_int.shape
-
-            # Flatten → [r3, (n1·n2·n3·n4)]
-            W_int_flat = W_int.contiguous().view(r3, n1 * n2 * n3 * n4)
-
-            # Multiply by ht_root [n5, r3] → [n5, (n1·n2·n3·n4)]
-            W_flat = torch.mm(self.ht_root, W_int_flat)
-
-            # Reshape → [n5, n1, n2, n3, n4]
-            W = W_flat.view(self.n5, n1, n2, n3, n4)
-            return W
-
-        else:
-            # # arity=3:
-            # W_int = torch.einsum(
-            #     'cab, aij, bkl -> cijkl',
-            #     self.ht_internal,  # [r3, r1, r2]
-            #     self.ht_left,      # [r1, n1, n2]
-            #     self.ht_right      # [r2, n3, n4]
-            # )
-            # # W_int: [r3, n1, n2, n3, n4]
-
-            # # Sum over c and permute ℓ to front → [n4, n1, n2, n3]
-            # W = W_int.sum(dim=0).permute(3, 0, 1, 2).contiguous()
-            # return W
-            if self.ht_tree == "A":
-                # — Tree A: exactly as before —
-                W_int = torch.einsum(
-                    'cab, aij, bkl -> cijkl',
-                    self.ht_internal,  # [r3, r1, r2]
-                    self.ht_left,      # [r1, n1, n2]
-                    self.ht_right      # [r2, n3, n4]
-                )
-                # W_int: [r3, n1, n2, n3, n4]
-                # Sum over c and permute ℓ (rel index) to front → [n4, n1, n2, n3]
-                W = W_int.sum(dim=0).permute(3, 0, 1, 2).contiguous()
-                return W
-
-            else:  # self.ht_tree == "C"
-                
-                # 1) Merge (e2,e3)->r1 and (r1,e1)->r2 in one einsum:
-                #    T_int[b, i1, i2, i3] = Σ_{a} ht_left[b,a,i1] * ht_mid[a,i2,i3]
-                T_int = torch.einsum('bak, aij -> bkij',
-                     self.ht_left,  # [r2, r1, n1]
-                     self.ht_mid)   # [r1, n2, n3]
-                    # Now T_int.shape == (r2, n1, n2, n3) as intended.
-
-                # Now T_int: [r2, n1, n2, n3]
-                # 2) Merge T_int [r2, *] → [r3, *] via ht_root [r3, r2]:
-                T_flat = T_int.reshape(self.r2, -1)            # [r2, n1·n2·n3]
-                U      = torch.mm(self.ht_root, T_flat)       # [r3, n1·n2·n3]
-                # 3) Merge U [r3, *] → [n4, *] via ht_final [n4, r3]:
-                W_flat = torch.mm(self.ht_final, U)           # [n4, n1·n2·n3]
-                W      = W_flat.view(self.n4, self.n1, self.n2, self.n3)
-                return W
-
-    def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
-        """
-        r_idx          : [B] relation indices
-        e_idx          : tuple of (arity) LongTensors, each [B], indices of known entity slots
-        miss_ent_domain: int ∈ {1..arity}: which entity slot is missing
-        W              : optionally precomputed HT core; if None, call build_W()
-
-        Returns:
-          pred: [B, #entities]  (softmax over all entity IDs)
-          W   : the HT core just built
-        """
-        B = r_idx.size(0)
-
-        # 1) Build (or reuse) HT core
-        if W is None:
-            W = self.build_W()
-            # If arity=4 → W ∈ [n5, n1, n2, n3, n4]
-            # If arity=3 → W ∈ [n4, n1, n2, n3]
-
-        # 2) “Slice by relation”:
-        #    Build rel_mode ∈ [B, n_rel]
-        r_raw  = self.bnr(self.R(r_idx))        # [B, d_r]
-        r_dp   = self.input_dropout(r_raw)       # [B, d_r]
-        r_mode = self.rel_proj(r_dp)             # [B, n_rel]
-
-        if self.ary == 4:
-            # W: [n5, n1, n2, n3, n4], flatten last 4 dims → [n5, M]
-            n5 = W.shape[0]
-            M  = self.n1 * self.n2 * self.n3 * self.n4
-            W_flat = W.view(n5, M)               # [n5, M]
-
-            # W_mat: [B, n1, n2, n3, n4] = r_mode [B,n5] @ W_flat [n5,M] → reshape
-            W_mat = torch.mm(r_mode, W_flat).view(B, self.n1, self.n2, self.n3, self.n4)
-
-        else:
-            # arity=3: W: [n4, n1, n2, n3] → flatten last 3 dims → [n4, M]
-            n4 = W.shape[0]
-            M  = self.n1 * self.n2 * self.n3
-            W_flat = W.view(n4, M)                # [n4, M]
-
-            W_mat = torch.mm(r_mode, W_flat).view(B, self.n1, self.n2, self.n3)
-
-        # 3) Pull out known entities, project, batchnorm, dropout, then contract
-        if self.ary == 4:
-            if miss_ent_domain == 1:
-                e2_idx, e3_idx, e4_idx = e_idx
-                e2_raw = self.bne(self.E(e2_idx));  e2_dp = self.input_dropout(e2_raw);  e2_mode = self.e2_proj(e2_dp)  # [B, n2]
-                e3_raw = self.bne(self.E(e3_idx));  e3_dp = self.input_dropout(e3_raw);  e3_mode = self.e3_proj(e3_dp)  # [B, n3]
-                e4_raw = self.bne(self.E(e4_idx));  e4_dp = self.input_dropout(e4_raw);  e4_mode = self.e4_proj(e4_dp)  # [B, n4]
-
-                # leave mode1 (n1):
-                # W_out[b,i] = sum_{j,k,l} W_mat[b,i,j,k,l] * e2_mode[b,j] * e3_mode[b,k] * e4_mode[b,l]
-                W_out = torch.einsum(
-                    'bijkl, bj, bk, bl -> bi',
-                    W_mat, e2_mode, e3_mode, e4_mode
-                )  # [B, n1]
-                n_missing = self.n1
-
-            elif miss_ent_domain == 2:
-                e1_idx, e3_idx, e4_idx = e_idx
-                e1_raw = self.bne(self.E(e1_idx));  e1_dp = self.input_dropout(e1_raw);  e1_mode = self.e1_proj(e1_dp)  # [B, n1]
-                e3_raw = self.bne(self.E(e3_idx));  e3_dp = self.input_dropout(e3_raw);  e3_mode = self.e3_proj(e3_dp)  # [B, n3]
-                e4_raw = self.bne(self.E(e4_idx));  e4_dp = self.input_dropout(e4_raw);  e4_mode = self.e4_proj(e4_dp)  # [B, n4]
-
-                # leave mode2 (n2):
-                # W_out[b,j] = sum_{i,k,l} W_mat[b,i,j,k,l] * e1_mode[b,i] * e3_mode[b,k] * e4_mode[b,l]
-                W_out = torch.einsum(
-                    'bijkl, bi, bk, bl -> bj',
-                    W_mat, e1_mode, e3_mode, e4_mode
-                )  # [B, n2]
-                n_missing = self.n2
-
-            elif miss_ent_domain == 3:
-                e1_idx, e2_idx, e4_idx = e_idx
-                e1_raw = self.bne(self.E(e1_idx));  e1_dp = self.input_dropout(e1_raw);  e1_mode = self.e1_proj(e1_dp)  # [B, n1]
-                e2_raw = self.bne(self.E(e2_idx));  e2_dp = self.input_dropout(e2_raw);  e2_mode = self.e2_proj(e2_dp)  # [B, n2]
-                e4_raw = self.bne(self.E(e4_idx));  e4_dp = self.input_dropout(e4_raw);  e4_mode = self.e4_proj(e4_dp)  # [B, n4]
-
-                # leave mode3 (n3):
-                # W_out[b,k] = sum_{i,j,l} W_mat[b,i,j,k,l] * e1_mode[b,i] * e2_mode[b,j] * e4_mode[b,l]
-                W_out = torch.einsum(
-                    'bijkl, bi, bj, bl -> bk',
-                    W_mat, e1_mode, e2_mode, e4_mode
-                )  # [B, n3]
-                n_missing = self.n3
-
-            else:  # miss_ent_domain == 4
-                e1_idx, e2_idx, e3_idx = e_idx
-                e1_raw = self.bne(self.E(e1_idx));  e1_dp = self.input_dropout(e1_raw);  e1_mode = self.e1_proj(e1_dp)  # [B, n1]
-                e2_raw = self.bne(self.E(e2_idx));  e2_dp = self.input_dropout(e2_raw);  e2_mode = self.e2_proj(e2_dp)  # [B, n2]
-                e3_raw = self.bne(self.E(e3_idx));  e3_dp = self.input_dropout(e3_raw);  e3_mode = self.e3_proj(e3_dp)  # [B, n3]
-
-                # leave mode4 (n4):
-                # W_out[b,l] = sum_{i,j,k} W_mat[b,i,j,k,l] * e1_mode[b,i] * e2_mode[b,j] * e3_mode[b,k]
-                W_out = torch.einsum(
-                    'bijkl, bi, bj, bk -> bl',
-                    W_mat, e1_mode, e2_mode, e3_mode
-                )  # [B, n4]
-                n_missing = self.n4
-
-        else:
-            # ARITY = 3
-            if miss_ent_domain == 1:
-                e2_idx, e3_idx = e_idx
-                e2_raw = self.bne(self.E(e2_idx));  e2_dp = self.input_dropout(e2_raw);  e2_mode = self.e2_proj(e2_dp)  # [B, n2]
-                e3_raw = self.bne(self.E(e3_idx));  e3_dp = self.input_dropout(e3_raw);  e3_mode = self.e3_proj(e3_dp)  # [B, n3]
-
-                # leave mode1 (n1):
-                # W_out[b,i] = sum_{j,k} W_mat[b,i,j,k] * e2_mode[b,j] * e3_mode[b,k]
-                W_out = torch.einsum(
-                    'bijk, bj, bk -> bi',
-                    W_mat, e2_mode, e3_mode
-                )  # [B, n1]
-                n_missing = self.n1
-
-            elif miss_ent_domain == 2:
-                e1_idx, e3_idx = e_idx
-                e1_raw = self.bne(self.E(e1_idx));  e1_dp = self.input_dropout(e1_raw);  e1_mode = self.e1_proj(e1_dp)  # [B, n1]
-                e3_raw = self.bne(self.E(e3_idx));  e3_dp = self.input_dropout(e3_raw);  e3_mode = self.e3_proj(e3_dp)  # [B, n3]
-
-                # leave mode2 (n2):
-                # W_out[b,j] = sum_{i,k} W_mat[b,i,j,k] * e1_mode[b,i] * e3_mode[b,k]
-                W_out = torch.einsum(
-                    'bijk, bi, bk -> bj',
-                    W_mat, e1_mode, e3_mode
-                )  # [B, n2]
-                n_missing = self.n2
-
-            else:  # miss_ent_domain == 3
-                e1_idx, e2_idx = e_idx
-                e1_raw = self.bne(self.E(e1_idx));  e1_dp = self.input_dropout(e1_raw);  e1_mode = self.e1_proj(e1_dp)  # [B, n1]
-                e2_raw = self.bne(self.E(e2_idx));  e2_dp = self.input_dropout(e2_raw);  e2_mode = self.e2_proj(e2_dp)  # [B, n2]
-
-                # leave mode3 (n3):
-                # W_out[b,k] = sum_{i,j} W_mat[b,i,j,k] * e1_mode[b,i] * e2_mode[b,j]
-                W_out = torch.einsum(
-                    'bijk, bi, bj -> bk',
-                    W_mat, e1_mode, e2_mode
-                )  # [B, n3]
-                n_missing = self.n3
-
-        # # At this point: W_out.shape = [B, n_missing]
-
-        # # 4) Build or reuse the two‐layer MLP now that we know n_missing
-        # if self.mlp_fc1 is None or self.mlp_fc1.in_features != n_missing:
-        #     mlp_hidden = max(n_missing // 2, 1)
-        #     self.mlp_fc1 = nn.Linear(n_missing, mlp_hidden, bias=False).to(self.device)
-        #     self.mlp_ln1 = nn.LayerNorm(mlp_hidden).to(self.device)
-        #     self.mlp_fc2 = nn.Linear(mlp_hidden, n_missing, bias=False).to(self.device)
-        #     self.mlp_ln2 = nn.LayerNorm(n_missing).to(self.device)
-        #     nn.init.xavier_uniform_(self.mlp_fc1.weight)
-        #     nn.init.xavier_uniform_(self.mlp_fc2.weight)
-
-        #     # Now that we know n_missing, set batchnorm for HT output
-        #     self.bnw = nn.BatchNorm1d(n_missing).to(self.device)
-        #     self.bn_missing = nn.BatchNorm1d(n_missing).to(self.device)
-
-        # # a) First MLP layer → [B, mlp_hidden]
-        # h1 = self.mlp_fc1(W_out)        # [B, mlp_hidden]
-        # h1 = self.mlp_ln1(h1)
-        # h1 = F.gelu(h1)
-        # h1 = self.hidden_dropout(h1)
-
-        # # b) Second MLP layer → [B, n_missing]
-        # h2 = self.mlp_fc2(h1)           # [B, n_missing]
-        # h2 = self.mlp_ln2(h2)
-
-        # # c) Residual
-        # W_out_enh = W_out + h2          # [B, n_missing]
-
-        # # 5) BatchNorm + Dropout on the enhanced output
-        # W_bn = self.bnw(W_out_enh)      # [B, n_missing]
-        # W_dp = self.hidden_dropout(W_bn)
-        # W_bn_missing = self.bn_missing(W_out_enh)   # BatchNorm1d(n_missing)
-        # W_dp_missing = self.hidden_dropout(W_bn_missing)  # [B, n_missing]
-        # # # 6) Score against all entity embeddings
-        # # x = torch.mm(W_dp, self.E.weight.t())  # [B, #entities]
-        # # pred = F.softmax(x, dim=1)
-        # # — ensure back_to_de/bn_de have the right input size:
-        # if self.back_to_de is None or self.back_to_de.in_features != n_missing:
-        #     # rebuild both layers now that we know n_missing
-        #     self.back_to_de = nn.Linear(n_missing, self.d_e, bias=False).to(self.device)
-        #     nn.init.xavier_uniform_(self.back_to_de.weight)
-        #     self.bn_de = nn.BatchNorm1d(self.d_e).to(self.device)
-        # # 6a) “Back-project” from [B × n_missing] down to [B × d_e]
-        # W_proj = self.back_to_de(W_dp)            # [B, d_e]
-
-        # # 6b) (optionally) batchnorm+dropout on that projected vector
-        # #W_bn2  = self.bnw(W_proj)                 # [B, d_e]
-        # W_bn2 = self.bn_de(W_proj)  # this BN expects exactly d_e features
-        # W_dp2  = self.hidden_dropout(W_bn2)       # [B, d_e]
-
-        # # 6c) Now we can safely multiply by E.weight.t(), since both dims match
-        # x     = torch.mm(W_dp2, self.E.weight.t())  # [B, #entities]
-        # pred  = F.softmax(x, dim=1)
-        # return pred, W
-        # if self.back_to_de is None or self.back_to_de.in_features != n_missing:
-        #     # rebuild back_to_de so it maps n_missing → d_e
-        #     self.back_to_de = nn.Linear(n_missing, self.d_e, bias=False).to(self.device)
-        #     nn.init.xavier_uniform_(self.back_to_de.weight)
-        #     self.bn_de = nn.BatchNorm1d(self.d_e).to(self.device)
-        
-        # W_proj = self.back_to_de(W_out)       # [B, d_e]
-        # W_proj_bn = self.bn_de(W_proj)        # [B, d_e]
-        # W_dp2 = self.hidden_dropout(W_proj_bn)
-        # x     = torch.mm(W_dp2, self.E.weight.t())
-        # pred  = F.softmax(x, dim=1)
-        # return pred, W
-                # … after computing W_out and n_missing …
-
-        # 4) Back‐project via the correct branch (1, 2, or 3):
-        if miss_ent_domain == 1:
-            if self.back_to_de_1 is None:
-                self.back_to_de_1 = nn.Linear(self.n1, self.d_e, bias=False).to(self.device)
-                nn.init.xavier_uniform_(self.back_to_de_1.weight)
-                self.bn_de_1 = nn.BatchNorm1d(self.d_e).to(self.device)
-            W_proj = self.back_to_de_1(W_out)   # [B, d_e]
-            W_proj = self.bn_de_1(W_proj)       # [B, d_e]
-            W_dp2  = self.hidden_dropout(W_proj)
-
-        elif miss_ent_domain == 2:
-            if self.back_to_de_2 is None:
-                self.back_to_de_2 = nn.Linear(self.n2, self.d_e, bias=False).to(self.device)
-                nn.init.xavier_uniform_(self.back_to_de_2.weight)
-                self.bn_de_2 = nn.BatchNorm1d(self.d_e).to(self.device)
-            W_proj = self.back_to_de_2(W_out)   # [B, d_e]
-            W_proj = self.bn_de_2(W_proj)       # [B, d_e]
-            W_dp2  = self.hidden_dropout(W_proj)
-
-        else:  # miss_ent_domain == 3
-            if self.back_to_de_3 is None:
-                self.back_to_de_3 = nn.Linear(self.n3, self.d_e, bias=False).to(self.device)
-                nn.init.xavier_uniform_(self.back_to_de_3.weight)
-                self.bn_de_3 = nn.BatchNorm1d(self.d_e).to(self.device)
-            W_proj = self.back_to_de_3(W_out)   # [B, d_e]
-            W_proj = self.bn_de_3(W_proj)       # [B, d_e]
-            W_dp2  = self.hidden_dropout(W_proj)
-
-        # 5) Final scoring:
-        x    = torch.mm(W_dp2, self.E.weight.t())  # [B, #entities]
-        pred = F.softmax(x, dim=1)
-        return pred, W
-
 import time
 import logging
 from itertools import combinations
@@ -569,9 +56,10 @@ class GETD_FC_opt_pos(nn.Module):
         self.E = nn.Embedding(len(data.entities), d_e, padding_idx=0).to(device)
         self.R = nn.Embedding(len(data.relations), d_r, padding_idx=0).to(device)
         # Random init
-        self.E.weight.data = 1e-3 * torch.randn_like(self.E.weight)
-        self.R.weight.data = 1e-3 * torch.randn_like(self.R.weight)
-
+        # self.E.weight.data = 1e-3 * torch.randn_like(self.E.weight)
+        # self.R.weight.data = 1e-3 * torch.randn_like(self.R.weight)
+        self.E.weight.data = (1e-3 * torch.randn((len(data.entities), d_e), dtype=torch.float).to(device))
+        self.R.weight.data = (1e-3 * torch.randn((len(data.relations), d_r), dtype=torch.float).to(device))
         # Position embeddings for each slot
         self.position = nn.Parameter(torch.randn(self.k, d_e) * 0.1)
 
@@ -677,7 +165,226 @@ class GETD_FC_opt_pos(nn.Module):
 
         return logits, W
 
+import torch
+import torch.nn.functional as F
+import numpy as np
+from itertools import combinations
 
+import math
+import torch
+import torch.nn.functional as F
+
+
+
+
+class GETD_new_FC(torch.nn.Module):
+    def __init__(self, d, d_e, d_r, ni_list, rank_list, device, chunks=3, **kwargs):
+        super().__init__()
+        self.k = len(ni_list)
+        assert self.k >= 2, "Need at least relation + entities"
+        assert len(rank_list) == self.k*(self.k-1)//2, \
+            f"need {self.k*(self.k-1)//2} bond ranks, got {len(rank_list)}"
+
+        # Precompute edges and bond ranks
+        self.edges = list(combinations(range(self.k), 2))
+        self.bond_ranks = {edge: rank_list[i] for i, edge in enumerate(self.edges)}
+        self.ni_list = ni_list
+        self.chunks  = chunks
+        # Embeddings
+        self.E = torch.nn.Embedding(len(d.entities), embedding_dim=d_e, padding_idx=0)
+        self.R = torch.nn.Embedding(len(d.relations), embedding_dim=d_r, padding_idx=0)
+        
+        self.E.weight.data = (1e-3 * torch.randn((len(d.entities), d_e), dtype=torch.float).to(device))
+        self.R.weight.data = (1e-3 * torch.randn((len(d.relations), d_r), dtype=torch.float).to(device))
+        
+        self.cores = torch.nn.ParameterList()
+        for i in range(self.k):
+            shape = []
+            for j in range(self.k):
+                if i == j:
+                    continue
+                edge = (i, j) if i < j else (j, i)
+                shape.append(self.bond_ranks[edge])
+            shape.append(self.ni_list[i])
+            # initialize with numpy uniform of shape tuple
+            size_tuple = tuple(shape)
+            G = torch.nn.Parameter(
+                torch.tensor(
+                    np.random.uniform(-1e-1, 1e-1, size_tuple),
+                    dtype=torch.float,
+                    requires_grad=True
+                ).to(device)
+            )
+            self.cores.append(G)
+        
+        self.loss = MyLoss()
+        self.input_dropout = torch.nn.Dropout(kwargs["input_dropout"])
+        self.hidden_dropout = torch.nn.Dropout(kwargs["hidden_dropout"])
+        self.bne = torch.nn.BatchNorm1d(d_e)
+        self.bnr = torch.nn.BatchNorm1d(d_r)
+        self.bnw = torch.nn.BatchNorm1d(d_e)
+        self.ary = len(d.train_data[0]) - 1
+ 
+
+
+
+    def forward(self, r_idx, e_idx, miss, W=None):
+        """
+        r_idx: (B,)
+        e_idx: list of two LongTensors, each (B,)
+        miss:   int 1/2/3 = which entity to predict
+        """
+        device = r_idx.device
+        B      = r_idx.size(0)
+        de     = self.E.embedding_dim
+        dr     = self.R.embedding_dim
+        G0,G1,G2,G3 = self.cores     # shapes: see above
+        n0,n1,n2,n3 = self.ni_list         # for clarity; you could read from self.ni_list
+
+        # Embeddings
+        r_emb = self.bnr(self.R(r_idx))                            # (B, dr)
+        e2    = self.bne(self.E(e_idx[0]))                          # (B, de)
+        e3    = self.bne(self.E(e_idx[1]))                          # (B, de)
+        r_emb = self.input_dropout(r_emb)
+        e2    = self.input_dropout(e2)
+        e3    = self.input_dropout(e3)
+
+        # Allocate the final logits buffer: shape (B, max domain size)
+        out_size = [n1,n2,n3][miss-1]
+        logits   = torch.zeros(B, out_size, device=device)
+
+        # Precompute slice boundaries for each mode
+        def boundaries(n):
+            step = math.ceil(n / self.chunks)
+            cuts = list(range(0, n, step))
+            return cuts + [n]  # ensure we end at n
+
+        a_bounds = boundaries(n0)  # e.g. [0,6,12,…,90]
+        b_bounds = boundaries(n1)
+        c_bounds = boundaries(n2)
+        d_bounds = boundaries(n3)
+
+        # Now the four‐deep loops
+        for ia in range(len(a_bounds)-1):
+            a0, a1 = a_bounds[ia],   a_bounds[ia+1]
+            # slice G0,G1 on their a‐index
+            G0_sub = G0[..., a0:a1]             # shape [90,90,90, a_slice]
+            r_sub  = r_emb[:, a0:a1]            # (B, a_slice)
+
+            for ib in range(len(b_bounds)-1):
+                b0, b1 = b_bounds[ib],   b_bounds[ib+1]
+                G1_sub = G1[..., b0:b1]         # shape [90,90,90, b_slice]
+
+                # fuse G0_sub + G1_sub over the i‐index
+                # result: [j,k,a_slice,b_slice]
+                K01 = torch.einsum('ijka,inlb->jkanlb',
+                                   G0_sub, G1_sub)
+
+                for ic in range(len(c_bounds)-1):
+                    c0, c1 = c_bounds[ic],   c_bounds[ic+1]
+                    G2_sub = G2[..., c0:c1]     # [90,90,90, c_slice]
+
+                    for idd in range(len(d_bounds)-1):
+                        d0, d1 = d_bounds[idd], d_bounds[idd+1]
+                        G3_sub = G3[..., d0:d1]   # [90,90,90, d_slice]
+
+                        # fuse G2_sub + G3_sub over m‐index
+                        # → [j,k,c_slice,d_slice]
+                        K23 = torch.einsum('jnmc,klmd->jnckld',
+                                           G2_sub, G3_sub)
+
+                        # fuse K01 + K23 over (j,k)
+                        # → block [a_slice, b_slice, c_slice, d_slice]
+                        block = torch.einsum('jkanlb,jnckld->abcd',
+                                             K01, K23)
+
+                        # now fuse in the relation embedding r_sub (over a)
+                        # → partial [B, b_slice, c_slice, d_slice]
+                        partial = torch.einsum('Ba,abcd->Bbcd',
+                                               r_sub, block)
+
+                        # finally, depending on which domain is missing,
+                        # contract the known embeddings to get [B, slice_dim]
+                        if miss == 1:
+                            # predicting b: known c→e2, d→e3
+                            e_c = e2[:, c0:c1]
+                            e_d = e3[:, d0:d1]
+                            # contract to get [B, b_slice]
+                            part_logit = torch.einsum('Bbcd, Bc, Bd -> Bb',
+                                                      partial, e_c, e_d)
+                            logits[:, b0:b1] += part_logit
+
+                        elif miss == 2:
+                            # predicting c: known b→e2, d→e3
+                            e_b = e2[:, b0:b1]
+                            e_d = e3[:, d0:d1]
+                            part_logit = torch.einsum('Bbcd, Bb, Bd -> Bc',
+                                                      partial, e_b, e_d)
+                            logits[:, c0:c1] += part_logit
+
+                        else:  # miss==3
+                            # predicting d: known b→e2, c→e3
+                            e_b = e2[:, b0:b1]
+                            e_c = e3[:, c0:c1]
+                            part_logit = torch.einsum('Bbcd, Bb, Bc -> Bd',
+                                                      partial, e_b, e_c)
+                            logits[:, d0:d1] += part_logit
+
+        # final BN + dropout
+        logits = self.bnw(logits)
+        logits = self.hidden_dropout(logits)
+
+        # and produce raw scores for all entities:
+        # x = logits @ self.E.weight.t()   # (B, #entities)
+        # return x
+        x = torch.mm(logits, self.E.weight.transpose(1, 0))
+
+        pred = F.softmax(x, dim=1)
+
+        return pred, W
+
+
+    # def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
+    #     de = self.E.weight.shape[1]
+    #     dr = self.R.weight.shape[1]
+    #     G0, G1, G2, G3 = self.cores
+        
+        
+ 
+    #     e2, e3 = self.bne(self.E(e_idx[0])), self.bne(self.E(e_idx[1]))
+    #     e2, e3 = self.input_dropout(e2), self.input_dropout(e3)
+        
+    #     if self.k == 4:
+            
+           
+    #         K01 = torch.einsum('ijka,inlb->jkanlb', G0, G1)
+    #         K23 = torch.einsum('jnmc,klmd->jnckld', G2, G3)
+    #         W0 = torch.einsum('jkanlb,jnckld->abcd', K01, K23)
+    #         W = W0.view(dr, de, de, de)
+    #         r = self.bnr(self.R(r_idx))
+    #         W_mat = torch.mm(r, W.view(r.size(1), -1))
+    #         W_mat = W_mat.view(-1, de, de, de)
+            
+    #         if miss_ent_domain == 1:
+    #             W_mat1 = torch.einsum('ijkl,il,ik->ij', W_mat, e3, e2)
+    #         elif miss_ent_domain == 2:
+    #             W_mat1 = torch.einsum('ijkl,il,ij->ik', W_mat, e3, e2)
+    #         elif miss_ent_domain == 3:
+    #             W_mat1 = torch.einsum('ijkl,ij,ik->il', W_mat, e2, e3)
+    #         torch.cuda.empty_cache()  
+    #         W_mat1 = self.bnw(W_mat1)
+    #         W_mat1 = self.hidden_dropout(W_mat1)
+    #         x = torch.mm(W_mat1, self.E.weight.transpose(1, 0))
+
+    #         pred = F.softmax(x, dim=1)
+
+    #         return pred, W
+
+
+
+
+
+    
 import numpy as np
 import torch
 import torch.nn as nn
@@ -703,9 +410,10 @@ class GETD_FC_opt(nn.Module):
         self.E = nn.Embedding(len(data.entities), d_e, padding_idx=0).to(device)
         self.R = nn.Embedding(len(data.relations), d_r, padding_idx=0).to(device)
         # Random init
-        self.E.weight.data = 1e-3 * torch.randn_like(self.E.weight)
-        self.R.weight.data = 1e-3 * torch.randn_like(self.R.weight)
-
+        # self.E.weight.data = 1e-3 * torch.randn_like(self.E.weight)
+        # self.R.weight.data = 1e-3 * torch.randn_like(self.R.weight)
+        self.E.weight.data = (1e-3 * torch.randn((len(data.entities), d_e), dtype=torch.float).to(device))
+        self.R.weight.data = (1e-3 * torch.randn((len(data.relations), d_r), dtype=torch.float).to(device))
         # Core tensors
         self.cores = nn.ParameterList()
         for i in range(self.k):
@@ -806,317 +514,6 @@ class GETD_FC_opt(nn.Module):
         logging.info(f"Step5 final layers: time={time.time()-start:.4f}s, mem={mem5:.1f}MiB")
 
         return logits, W
-
-class GETD_HT3(nn.Module):
-    def __init__(self, d, d_e, d_r, k, ni_list, ranks, device, **kwargs):
-        """
-        d         : dataset object (each row in d.train_data has arity+1 = 4 or 5 entries)
-        d_e       : entity embedding dimension
-        d_r       : relation embedding dimension
-        k         : number of cores (ignored except for asserting len(ni_list) = 3)
-        ni_list   : list of 3 positive ints [r1, r2, r3], the HT ranks at each level
-        ranks     : unused (kept for TR compatibility)
-        device    : 'cuda' or 'cpu'
-        kwargs    : e.g. input_dropout, hidden_dropout
-        """
-        super(GETD_HT3, self).__init__()
-
-        # — entity & relation embeddings —
-        self.E = nn.Embedding(len(d.entities), d_e, padding_idx=0)
-        self.R = nn.Embedding(len(d.relations), d_r, padding_idx=0)
-        nn.init.normal_(self.E.weight, 0, 1e-3)
-        nn.init.normal_(self.R.weight, 0, 1e-3)
-
-        # — dropout & batch-norm for embeddings —
-        self.input_dropout  = nn.Dropout(kwargs.get("input_dropout", 0.2))
-        self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout", 0.2))
-        self.bne = nn.BatchNorm1d(d_e)
-        self.bnr = nn.BatchNorm1d(d_r)
-        self.bnw = nn.BatchNorm1d(d_e)
-
-        self.loss = MyLoss()
-
-        # — detect arity (3 or 4) —
-        self.ary = len(d.train_data[0]) - 1
-        assert self.ary in (3, 4), "Only arity 3 or 4 are supported"
-        self.d_e = d_e
-        self.d_r = d_r
-
-        # — parse ni_list = [r₁, r₂, r₃] —
-        assert isinstance(ni_list, (list, tuple)) and len(ni_list) == 3, \
-            "ni_list must be a list of 3 positive ints ([r1,r2,r3])"
-        r1, r2, r3 = ni_list
-        assert all(isinstance(x, int) and x > 0 for x in (r1, r2, r3)), \
-            "All entries in ni_list must be positive integers"
-
-        if self.ary == 4:
-            # — arity=4 HT tree (4 entities + 1 relation) —
-            #   Level-1: merge (e1,e2)→rank-r1  and  (e3,e4)→rank-r2
-            self.ht_left     = nn.Parameter(torch.randn(r1, d_e, d_e, device=device) * 1e-1)
-            self.ht_right    = nn.Parameter(torch.randn(r2, d_e, d_e, device=device) * 1e-1)
-            #   Level-2: merge those two rank‐vectors → internal rank-r3
-            self.ht_internal = nn.Parameter(torch.randn(r3, r1, r2, device=device) * 1e-1)
-            #   Root: merge internal rank‐vector (r3) with relation dim d_r
-            self.ht_root     = nn.Parameter(torch.randn(d_r, r3, device=device) * 1e-1)
-
-        else:  # self.ary == 3
-            # — arity=3 HT tree (3 entities + 1 relation) —
-            #   Level-1a: merge (e1,e2)→rank-r1
-            self.ht_left     = nn.Parameter(torch.randn(r1, d_e, d_e, device=device) * 1e-1)
-            #   Level-1b: merge (e3,relation)→rank-r2  (note: relation dimension is d_r)
-            self.ht_right    = nn.Parameter(torch.randn(r2, d_e, d_r, device=device) * 1e-1)
-            #   Level-2: merge those two rank‐vectors → internal rank-r3
-            self.ht_internal = nn.Parameter(torch.randn(r3, r1, r2, device=device) * 1e-1)
-            #   No separate “ht_root” here, since relation is already merged in ht_right.
-
-    def build_W(self):
-        """
-        Build the HT core depending on arity:
-
-        For arity=4:
-          1) W_int[c,i,j,k,l] = ∑_{a,b}
-                 ht_internal[c,a,b] · ht_left[a,i,j] · ht_right[b,k,l]
-             → shape [r₃, d_e, d_e, d_e, d_e]
-          2) flatten W_int→[r₃, d_e⁴], mm with ht_root [d_r, r₃] →[d_r, d_e⁴], reshape→[d_r, d_e, d_e, d_e, d_e]
-
-        For arity=3:
-          1) W_int[c,i,j,k,ℓ] = ∑_{a,b}
-                 ht_internal[c,a,b] · ht_left[a,i,j] · ht_right[b,k,ℓ]
-             where i,j=entity dims, k=third‐entity dim, ℓ=relation dim
-             → shape [r₃, d_e, d_e, d_e, d_r]
-          2) collapse c by summing over c, and permute so ℓ is first:
-             W[ℓ,i,j,k] = ∑_{c} W_int[c,i,j,k,ℓ]
-             → final W has shape [d_r, d_e, d_e, d_e]
-        """
-        de = self.d_e
-        dr = self.d_r
-
-        if self.ary == 4:
-            # Step 1: merge level-1 and level-2
-            W_int = torch.einsum(
-                'cab, aij, bkl -> cijkl',
-                self.ht_internal,  # [r3, r1, r2]
-                self.ht_left,      # [r1, de, de]
-                self.ht_right      # [r2, de, de]
-            )
-            # W_int is [r3, de, de, de, de]
-
-            # Step 2a: flatten to [r3, d_e⁴]
-            r3, _, _, _, _ = W_int.shape
-            W_int_flat = W_int.view(r3, de**4)  # [r3, de^4]
-
-            # Step 2b: mm with ht_root [d_r, r3] → [d_r, d_e^4]
-            W_flat = torch.mm(self.ht_root, W_int_flat)  # [dr, de^4]
-
-            # Step 2c: reshape to [d_r, de, de, de, de]
-            W = W_flat.view(dr, de, de, de, de)  # [dr, de, de, de, de]
-            return W
-
-        else:
-            # arity=3 case
-            # Step 1: merge level-1a and level-1b through level-2
-            W_int = torch.einsum(
-                'cab, aij, bkl -> cijkl',
-                self.ht_internal,  # [r3, r1, r2]
-                self.ht_left,      # [r1, de, de]
-                self.ht_right      # [r2, de, dr]
-            )
-            # W_int shape = [r3, de, de, de, dr]
-
-            # Step 2: sum over c and bring ℓ(=relation) to front:
-            #   W[c,i,j,k,ℓ] → W_sum[ℓ,i,j,k]
-            W = torch.einsum('cijkl->lijk', W_int)  # [dr, de, de, de]
-            return W
-
-    def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
-        """
-        r_idx          : [B] relation indices
-        e_idx          : tuple of three 1D tensors, indices of the known entity slots
-        miss_ent_domain: int in {1,2,3,4} indicating which entity is missing
-        W              : optionally precomputed HT core; if None, build it
-        """
-        B   = r_idx.size(0)
-        de  = self.d_e
-        dr  = self.d_r
-
-        # 1) build or reuse the core
-        if W is None:
-            W = self.build_W()
-            # If arity=4, W is [dr, de, de, de, de]
-            # If arity=3, W is [dr, de, de, de]
-
-        # 2) slice out each batch’s core based on r_idx
-        r_emb = self.bnr(self.R(r_idx))  # [B, d_r]
-
-        if self.ary == 4:
-            # flatten W to [dr, de^4], then mm to get [B, de^4]
-            W_mat = torch.mm(r_emb, W.view(dr, -1))  # [B, de^4]
-            W_mat = W_mat.view(B, de, de, de, de)     # [B, de, de, de, de]
-
-            # 3a) gather & normalize/dropout the known 3 entity embeddings
-            if   miss_ent_domain == 1:
-                # known: e2, e3, e4
-                e2, e3, e4 = [self.input_dropout(self.bne(self.E(idx))) for idx in e_idx]
-                # contract out dims j,k,l → keep i
-                W_out = torch.einsum('bijkl,bj,bk,bl->bi', W_mat, e2, e3, e4)  # [B, de]
-            elif miss_ent_domain == 2:
-                # known: e1, e3, e4
-                e1, e3, e4 = [self.input_dropout(self.bne(self.E(idx))) for idx in e_idx]
-                W_out = torch.einsum('bijkl,bi,bk,bl->bj', W_mat, e1, e3, e4)  # [B, de]
-            elif miss_ent_domain == 3:
-                # known: e1, e2, e4
-                e1, e2, e4 = [self.input_dropout(self.bne(self.E(idx))) for idx in e_idx]
-                W_out = torch.einsum('bijkl,bi,bj,bl->bk', W_mat, e1, e2, e4)  # [B, de]
-            else:  # miss_ent_domain == 4
-                # known: e1, e2, e3
-                e1, e2, e3 = [self.input_dropout(self.bne(self.E(idx))) for idx in e_idx]
-                W_out = torch.einsum('bijkl,bi,bj,bk->bl', W_mat, e1, e2, e3)  # [B, de]
-
-        else:  # self.ary == 3
-            # W is [dr, de, de, de], flatten to [dr, de^3]
-            W_mat = torch.mm(r_emb, W.view(dr, -1))  # [B, de^3]
-            W_mat = W_mat.view(B, de, de, de)        # [B, de, de, de]
-
-            # 3b) gather & normalize/dropout known entity embeddings:
-            if   miss_ent_domain == 1:
-                # known: e2, e3
-                e2, e3 = [self.input_dropout(self.bne(self.E(idx))) for idx in e_idx]
-                # contract k→e3, j→e2 → leave i
-                W_out = torch.einsum('bijk,ik,ij->bi', W_mat, e3, e2)  # [B, de]
-            elif miss_ent_domain == 2:
-                # known: e1, e3
-                e1, e3 = [self.input_dropout(self.bne(self.E(idx))) for idx in e_idx]
-                W_out = torch.einsum('bijk,ij,ik->bj', W_mat, e1, e3)  # [B, de]
-            else:  # miss_ent_domain == 3
-                # known: e1, e2
-                e1, e2 = [self.input_dropout(self.bne(self.E(idx))) for idx in e_idx]
-                W_out = torch.einsum('bijk,ij,ik->bk', W_mat, e1, e2)  # [B, de]
-
-        # 4) final batchnorm, dropout, score
-        W_out = self.bnw(W_out)               # [B, de]
-        W_out = self.hidden_dropout(W_out)    # [B, de]
-        x     = torch.mm(W_out, self.E.weight.t())  # [B, #entities]
-        pred  = F.softmax(x, dim=1)           # [B, #entities]
-
-        return pred, W
-
-class GETD_HT(nn.Module):
-    def __init__(self, d, d_e, d_r, k, ni, ranks, device, **kwargs):
-        super(GETD_HT, self).__init__()
-        # entity & relation embeddings
-        self.E = nn.Embedding(len(d.entities), d_e, padding_idx=0)
-        self.R = nn.Embedding(len(d.relations), d_r, padding_idx=0)
-        nn.init.normal_(self.E.weight, 0, 1e-3)
-        nn.init.normal_(self.R.weight, 0, 1e-3)
-
-        # dropouts & batch-norms
-        self.input_dropout  = nn.Dropout(kwargs.get("input_dropout", 0.2))
-        self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout", 0.2))
-        self.bne = nn.BatchNorm1d(d_e)
-        self.bnr = nn.BatchNorm1d(d_r)
-        self.bnw = nn.BatchNorm1d(d_e)
-
-        # we only support arity = 4 here
-        assert len(d.train_data[0]) - 1 == 4, "This HT module is arity-4 only"
-        self.ary = 4
-
-        # HT rank
-        r = ranks
-
-        # Level-1 cores: left merges (e1,e2), right merges (e3,e4)
-        #   ht_left[a,i,j]  merges embedding dims i,j → rank-a
-        #   ht_right[b,k,l] merges embedding dims k,l → rank-b
-        self.ht_left     = nn.Parameter(torch.randn(r, d_e, d_e) * 1e-1)
-        self.ht_right    = nn.Parameter(torch.randn(r, d_e, d_e) * 1e-1)
-
-        # Level-2 core: merges those two rank vectors → an internal rank-c
-        self.ht_internal = nn.Parameter(torch.randn(r, r, r) * 1e-1)
-
-        # Root core: merges internal rank-c with the relation embedding dim d_r
-        self.ht_root     = nn.Parameter(torch.randn(d_r, r) * 1e-1)
-
-        self.loss = MyLoss()
-
-    def build_W(self):
-        """
-        Build the full 5-D weight tensor W[d,i,j,k,l] via HT:
-          1) contract ht_left & ht_right through ht_internal → W_int[c,i,j,k,l]
-          2) contract W_int with ht_root → W[d,i,j,k,l]
-        """
-        # 1) cijkl = sum_{a,b} ht_internal[c,a,b] * ht_left[a,i,j] * ht_right[b,k,l]
-        W_int = torch.einsum(
-            'cab, aij, bkl -> cijkl',
-            self.ht_internal,  # [r,    r,    r]
-            self.ht_left,      # [r,    de,   de]
-            self.ht_right      # [r,    de,   de]
-        )
-        # 2) dijkl = sum_c ht_root[d,c] * W_int[c,i,j,k,l]
-        W = torch.einsum(
-            'dc, cijkl -> dijkl',
-            self.ht_root,   # [dr,   r]
-            W_int           # [r,    de,   de,   de,   de]
-        )
-        # result: [dr, de, de, de, de]
-        return W
-
-    def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
-        B = r_idx.size(0)
-        de = self.E.embedding_dim
-        dr = self.R.embedding_dim
-
-        # 1) build (or reuse) the full core
-        if W is None:
-            W = self.build_W()               # [dr, de, de, de, de]
-
-        # 2) condition on relation: each batch gets its own slice of W
-        r_emb = self.bnr(self.R(r_idx))       # [B, dr]
-        W_mat = torch.mm(r_emb, W.view(dr, -1))  # [B, de^4]
-        W_mat = W_mat.view(B, de, de, de, de)     # [B, de, de, de, de]
-
-        # 3) pull out the known entity embeddings & normalize/dropout
-        #    e_idx is always a triplet of the *known* slots in the order e_idx[0],e_idx[1],e_idx[2]
-        e1 = e2 = e3 = e4 = None
-        if   miss_ent_domain == 1:
-            # known: e2,e3,e4
-            e2,e3,e4 = [ self.input_dropout(self.bne(self.E(idx))) for idx in e_idx ]
-        elif miss_ent_domain == 2:
-            # known: e1,e3,e4
-            e1,e3,e4 = [ self.input_dropout(self.bne(self.E(idx))) for idx in e_idx ]
-        elif miss_ent_domain == 3:
-            # known: e1,e2,e4
-            e1,e2,e4 = [ self.input_dropout(self.bne(self.E(idx))) for idx in e_idx ]
-        elif miss_ent_domain == 4:
-            # known: e1,e2,e3
-            e1,e2,e3 = [ self.input_dropout(self.bne(self.E(idx))) for idx in e_idx ]
-        else:
-            raise ValueError("miss_ent_domain must be 1..4")
-
-        # 4) contract out the known three entity dims, leaving a [B, de] score vector
-        if   miss_ent_domain == 1:
-            # W_mat[b,i,j,k,l], contract j,k,l with e2,e3,e4 → leave i
-            W_out = torch.einsum('bijkl,bj,bk,bl->bi',
-                                W_mat, e2, e3, e4)
-        elif miss_ent_domain == 2:
-            # leave j
-            W_out = torch.einsum('bijkl,bi,bk,bl->bj',
-                                W_mat, e1, e3, e4)
-        elif miss_ent_domain == 3:
-            # leave k
-            W_out = torch.einsum('bijkl,bi,bj,bl->bk',
-                                W_mat, e1, e2, e4)
-        else:  # miss_ent_domain == 4
-            # leave l
-            W_out = torch.einsum('bijkl,bi,bj,bk->bl',
-                                W_mat, e1, e2, e3)
-
-        # 5) batch-norm, dropout, then score against all entity embeddings
-        W_out = self.bnw(W_out)                 # [B, de]
-        W_out = self.hidden_dropout(W_out)      # [B, de]
-        x = torch.mm(W_out, self.E.weight.t())  # [B, #entities]
-        pred = F.softmax(x, dim=1)
-
-        return pred, W
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
