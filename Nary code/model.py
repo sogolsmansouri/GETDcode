@@ -190,6 +190,7 @@ class GETD_new_FC(torch.nn.Module):
         self.bond_ranks = {edge: rank_list[i] for i, edge in enumerate(self.edges)}
         self.ni_list = ni_list
         self.chunks  = chunks
+        self.rank_list = rank_list
         # Embeddings
         self.E = torch.nn.Embedding(len(d.entities), embedding_dim=d_e, padding_idx=0)
         self.R = torch.nn.Embedding(len(d.relations), embedding_dim=d_r, padding_idx=0)
@@ -226,122 +227,223 @@ class GETD_new_FC(torch.nn.Module):
         self.ary = len(d.train_data[0]) - 1
  
 
-
-
     def forward(self, r_idx, e_idx, miss, W=None):
         """
-        r_idx: (B,)
-        e_idx: list of two LongTensors, each (B,)
-        miss:   int 1/2/3 = which entity to predict
+        r_idx: (B,)                  # relation indices per batch
+        e_idx: list of two (B,)     # entity indices for the two known entities
+        miss:   int in {1,2,3}      # which entity to predict
         """
         device = r_idx.device
         B      = r_idx.size(0)
         de     = self.E.embedding_dim
         dr     = self.R.embedding_dim
-        G0,G1,G2,G3 = self.cores     # shapes: see above
-        n0,n1,n2,n3 = self.ni_list         # for clarity; you could read from self.ni_list
 
-        # Embeddings
-        r_emb = self.bnr(self.R(r_idx))                            # (B, dr)
-        e2    = self.bne(self.E(e_idx[0]))                          # (B, de)
-        e3    = self.bne(self.E(e_idx[1]))                          # (B, de)
-        r_emb = self.input_dropout(r_emb)
-        e2    = self.input_dropout(e2)
-        e3    = self.input_dropout(e3)
+        # unpack our 4 three-way cores
+        G0, G1, G2, G3 = self.cores    # shapes: G0[i,j,k,a], G1[i,n,l,b], G2[j,n,m,c], G3[k,l,m,d]
+        n0,n1,n2,n3   = self.ni_list   # num entities per slot
+        # bond ranks: i = self.rank_list[0], m = self.rank_list[5]
+        i_size = self.rank_list[0]
+        m_size = self.rank_list[5]
 
-        # Allocate the final logits buffer: shape (B, max domain size)
-        out_size = [n1,n2,n3][miss-1]
-        logits   = torch.zeros(B, out_size, device=device)
-
-        # Precompute slice boundaries for each mode
+        # helper to split any dimension into ~self.chunks pieces
         def boundaries(n):
             step = math.ceil(n / self.chunks)
             cuts = list(range(0, n, step))
-            return cuts + [n]  # ensure we end at n
+            return cuts + [n]
 
-        a_bounds = boundaries(n0)  # e.g. [0,6,12,…,90]
+        # compute slice boundaries for each mode and both rank dims
+        a_bounds = boundaries(n0)
         b_bounds = boundaries(n1)
         c_bounds = boundaries(n2)
         d_bounds = boundaries(n3)
+        i_bounds = boundaries(i_size)
+        m_bounds = boundaries(m_size)
 
-        # Now the four‐deep loops
+        # compute embeddings + dropouts
+        r_emb = self.input_dropout(self.bnr(self.R(r_idx)))  # (B, dr)
+        e2    = self.input_dropout(self.bne(self.E(e_idx[0])))# (B, de)
+        e3    = self.input_dropout(self.bne(self.E(e_idx[1])))# (B, de)
+
+        # final logits buffer
+        out_size = [n1, n2, n3][miss-1]
+        logits   = torch.zeros(B, out_size, device=device)
+
+        # four nested loops over mode slices, plus two loops over rank slices
         for ia in range(len(a_bounds)-1):
-            a0, a1 = a_bounds[ia],   a_bounds[ia+1]
-            # slice G0,G1 on their a‐index
-            G0_sub = G0[..., a0:a1]             # shape [90,90,90, a_slice]
-            r_sub  = r_emb[:, a0:a1]            # (B, a_slice)
+            a0, a1 = a_bounds[ia], a_bounds[ia+1]
+            # slice core-mode a
+            G0_a = G0[..., a0:a1]             # [i, j, k, a_slice]
+            r_sub = r_emb[:, a0:a1]           # (B, a_slice)
 
             for ib in range(len(b_bounds)-1):
-                b0, b1 = b_bounds[ib],   b_bounds[ib+1]
-                G1_sub = G1[..., b0:b1]         # shape [90,90,90, b_slice]
+                b0, b1 = b_bounds[ib], b_bounds[ib+1]
+                G1_b = G1[..., b0:b1]         # [i, n, l, b_slice]
 
-                # fuse G0_sub + G1_sub over the i‐index
-                # result: [j,k,a_slice,b_slice]
-                K01 = torch.einsum('ijka,inlb->jkanlb',
-                                   G0_sub, G1_sub)
+                # chunk over bond-rank i for K01
+                K01_sum = None
+                for ir in range(len(i_bounds)-1):
+                    i0, i1 = i_bounds[ir], i_bounds[ir+1]
+                    G0_ir = G0_a[i0:i1, ...]   # [i_slice, j, k, a_slice]
+                    G1_ir = G1_b[i0:i1, ...]   # [i_slice, n, l, b_slice]
+                    part01 = torch.einsum('ijka,inlb->jkanlb', G0_ir, G1_ir)
+                    K01_sum = part01 if K01_sum is None else K01_sum + part01
 
                 for ic in range(len(c_bounds)-1):
-                    c0, c1 = c_bounds[ic],   c_bounds[ic+1]
-                    G2_sub = G2[..., c0:c1]     # [90,90,90, c_slice]
+                    c0, c1 = c_bounds[ic], c_bounds[ic+1]
+                    G2_c = G2[..., c0:c1]     # [j, n, m, c_slice]
 
                     for idd in range(len(d_bounds)-1):
                         d0, d1 = d_bounds[idd], d_bounds[idd+1]
-                        G3_sub = G3[..., d0:d1]   # [90,90,90, d_slice]
+                        G3_d = G3[..., d0:d1]   # [k, l, m, d_slice]
 
-                        # fuse G2_sub + G3_sub over m‐index
-                        # → [j,k,c_slice,d_slice]
-                        K23 = torch.einsum('jnmc,klmd->jnckld',
-                                           G2_sub, G3_sub)
+                        # chunk over bond-rank m for K23
+                        K23_sum = None
+                        for im in range(len(m_bounds)-1):
+                            m0, m1 = m_bounds[im], m_bounds[im+1]
+                            G2_cm = G2_c[..., m0:m1, :]  # [j, n, m_slice, c_slice]
+                            G3_dm = G3_d[..., m0:m1, :]  # [k, l, m_slice, d_slice]
+                            part23 = torch.einsum('jnmc,klmd->jnckld', G2_cm, G3_dm)
+                            K23_sum = part23 if K23_sum is None else K23_sum + part23
 
-                        # fuse K01 + K23 over (j,k)
-                        # → block [a_slice, b_slice, c_slice, d_slice]
-                        block = torch.einsum('jkanlb,jnckld->abcd',
-                                             K01, K23)
+                        # fuse K01 + K23 -> [a_slice, b_slice, c_slice, d_slice]
+                        block = torch.einsum('jkanlb,jnckld->abcd', K01_sum, K23_sum)
 
-                        # now fuse in the relation embedding r_sub (over a)
-                        # → partial [B, b_slice, c_slice, d_slice]
-                        partial = torch.einsum('Ba,abcd->Bbcd',
-                                               r_sub, block)
+                        # fuse relation embedding -> [B, b_slice, c_slice, d_slice]
+                        partial = torch.einsum('Ba,abcd->Bbcd', r_sub, block)
 
-                        # finally, depending on which domain is missing,
-                        # contract the known embeddings to get [B, slice_dim]
-                        if miss == 1:
-                            # predicting b: known c→e2, d→e3
-                            e_c = e2[:, c0:c1]
-                            e_d = e3[:, d0:d1]
-                            # contract to get [B, b_slice]
-                            part_logit = torch.einsum('Bbcd, Bc, Bd -> Bb',
-                                                      partial, e_c, e_d)
-                            logits[:, b0:b1] += part_logit
-
+                        # contract known entity embeddings into logits
+                        if   miss == 1:
+                            ec = e2[:, c0:c1]; ed = e3[:, d0:d1]
+                            logits[:, b0:b1] += torch.einsum('Bbcd,Bc,Bd->Bb', partial, ec, ed)
                         elif miss == 2:
-                            # predicting c: known b→e2, d→e3
-                            e_b = e2[:, b0:b1]
-                            e_d = e3[:, d0:d1]
-                            part_logit = torch.einsum('Bbcd, Bb, Bd -> Bc',
-                                                      partial, e_b, e_d)
-                            logits[:, c0:c1] += part_logit
+                            eb = e2[:, b0:b1]; ed = e3[:, d0:d1]
+                            logits[:, c0:c1] += torch.einsum('Bbcd,Bb,Bd->Bc', partial, eb, ed)
+                        else:
+                            eb = e2[:, b0:b1]; ec = e3[:, c0:c1]
+                            logits[:, d0:d1] += torch.einsum('Bbcd,Bb,Bc->Bd', partial, eb, ec)
 
-                        else:  # miss==3
-                            # predicting d: known b→e2, c→e3
-                            e_b = e2[:, b0:b1]
-                            e_c = e3[:, c0:c1]
-                            part_logit = torch.einsum('Bbcd, Bb, Bc -> Bd',
-                                                      partial, e_b, e_c)
-                            logits[:, d0:d1] += part_logit
+        # final BN + dropout + softmax over entity embedding matrix
+        logits = self.hidden_dropout(self.bnw(logits))
+        x      = torch.mm(logits, self.E.weight.t())  # (B, #entities)
 
-        # final BN + dropout
-        logits = self.bnw(logits)
-        logits = self.hidden_dropout(logits)
-
-        # and produce raw scores for all entities:
-        # x = logits @ self.E.weight.t()   # (B, #entities)
-        # return x
-        x = torch.mm(logits, self.E.weight.transpose(1, 0))
-
-        pred = F.softmax(x, dim=1)
-
+        pred   = F.softmax(x, dim=1)
         return pred, W
+
+
+    # def forward(self, r_idx, e_idx, miss, W=None):
+    #     """
+    #     r_idx: (B,)
+    #     e_idx: list of two LongTensors, each (B,)
+    #     miss:   int 1/2/3 = which entity to predict
+    #     """
+    #     device = r_idx.device
+    #     B      = r_idx.size(0)
+    #     de     = self.E.embedding_dim
+    #     dr     = self.R.embedding_dim
+    #     G0,G1,G2,G3 = self.cores     # shapes: see above
+    #     n0,n1,n2,n3 = self.ni_list         # for clarity; you could read from self.ni_list
+
+    #     # Embeddings
+    #     r_emb = self.bnr(self.R(r_idx))                            # (B, dr)
+    #     e2    = self.bne(self.E(e_idx[0]))                          # (B, de)
+    #     e3    = self.bne(self.E(e_idx[1]))                          # (B, de)
+    #     r_emb = self.input_dropout(r_emb)
+    #     e2    = self.input_dropout(e2)
+    #     e3    = self.input_dropout(e3)
+
+    #     # Allocate the final logits buffer: shape (B, max domain size)
+    #     out_size = [n1,n2,n3][miss-1]
+    #     logits   = torch.zeros(B, out_size, device=device)
+
+    #     # Precompute slice boundaries for each mode
+    #     def boundaries(n):
+    #         step = math.ceil(n / self.chunks)
+    #         cuts = list(range(0, n, step))
+    #         return cuts + [n]  # ensure we end at n
+
+    #     a_bounds = boundaries(n0)  # e.g. [0,6,12,…,90]
+    #     b_bounds = boundaries(n1)
+    #     c_bounds = boundaries(n2)
+    #     d_bounds = boundaries(n3)
+
+    #     # Now the four‐deep loops
+    #     for ia in range(len(a_bounds)-1):
+    #         a0, a1 = a_bounds[ia],   a_bounds[ia+1]
+    #         # slice G0,G1 on their a‐index
+    #         G0_sub = G0[..., a0:a1]             # shape [90,90,90, a_slice]
+    #         r_sub  = r_emb[:, a0:a1]            # (B, a_slice)
+
+    #         for ib in range(len(b_bounds)-1):
+    #             b0, b1 = b_bounds[ib],   b_bounds[ib+1]
+    #             G1_sub = G1[..., b0:b1]         # shape [90,90,90, b_slice]
+
+    #             # fuse G0_sub + G1_sub over the i‐index
+    #             # result: [j,k,a_slice,b_slice]
+    #             K01 = torch.einsum('ijka,inlb->jkanlb',
+    #                                G0_sub, G1_sub)
+
+    #             for ic in range(len(c_bounds)-1):
+    #                 c0, c1 = c_bounds[ic],   c_bounds[ic+1]
+    #                 G2_sub = G2[..., c0:c1]     # [90,90,90, c_slice]
+
+    #                 for idd in range(len(d_bounds)-1):
+    #                     d0, d1 = d_bounds[idd], d_bounds[idd+1]
+    #                     G3_sub = G3[..., d0:d1]   # [90,90,90, d_slice]
+
+    #                     # fuse G2_sub + G3_sub over m‐index
+    #                     # → [j,k,c_slice,d_slice]
+    #                     K23 = torch.einsum('jnmc,klmd->jnckld',
+    #                                        G2_sub, G3_sub)
+
+    #                     # fuse K01 + K23 over (j,k)
+    #                     # → block [a_slice, b_slice, c_slice, d_slice]
+    #                     block = torch.einsum('jkanlb,jnckld->abcd',
+    #                                          K01, K23)
+
+    #                     # now fuse in the relation embedding r_sub (over a)
+    #                     # → partial [B, b_slice, c_slice, d_slice]
+    #                     partial = torch.einsum('Ba,abcd->Bbcd',
+    #                                            r_sub, block)
+
+    #                     # finally, depending on which domain is missing,
+    #                     # contract the known embeddings to get [B, slice_dim]
+    #                     if miss == 1:
+    #                         # predicting b: known c→e2, d→e3
+    #                         e_c = e2[:, c0:c1]
+    #                         e_d = e3[:, d0:d1]
+    #                         # contract to get [B, b_slice]
+    #                         part_logit = torch.einsum('Bbcd, Bc, Bd -> Bb',
+    #                                                   partial, e_c, e_d)
+    #                         logits[:, b0:b1] += part_logit
+
+    #                     elif miss == 2:
+    #                         # predicting c: known b→e2, d→e3
+    #                         e_b = e2[:, b0:b1]
+    #                         e_d = e3[:, d0:d1]
+    #                         part_logit = torch.einsum('Bbcd, Bb, Bd -> Bc',
+    #                                                   partial, e_b, e_d)
+    #                         logits[:, c0:c1] += part_logit
+
+    #                     else:  # miss==3
+    #                         # predicting d: known b→e2, c→e3
+    #                         e_b = e2[:, b0:b1]
+    #                         e_c = e3[:, c0:c1]
+    #                         part_logit = torch.einsum('Bbcd, Bb, Bc -> Bd',
+    #                                                   partial, e_b, e_c)
+    #                         logits[:, d0:d1] += part_logit
+
+    #     # final BN + dropout
+    #     logits = self.bnw(logits)
+    #     logits = self.hidden_dropout(logits)
+
+    #     # and produce raw scores for all entities:
+    #     # x = logits @ self.E.weight.t()   # (B, #entities)
+    #     # return x
+    #     x = torch.mm(logits, self.E.weight.transpose(1, 0))
+
+    #     pred = F.softmax(x, dim=1)
+
+    #     return pred, W
 
 
     # def forward(self, r_idx, e_idx, miss_ent_domain, W=None):
