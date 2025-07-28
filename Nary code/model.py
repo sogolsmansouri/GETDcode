@@ -174,6 +174,175 @@ import math
 import torch
 import torch.nn.functional as F
 
+import math
+import torch
+import torch.nn.functional as F
+from itertools import combinations
+
+class GETD_FC_chunked(torch.nn.Module):
+    def __init__(self, d, d_e, d_r, ni_list, rank_list, device, chunks=15, **kwargs):
+        super().__init__()
+        assert len(ni_list) == 4, "This is specialized to k=4"
+        assert len(rank_list) == 6, "Expect 6 bond-ranks for 4 nodes"
+
+        self.device    = device
+        self.chunks    = chunks
+        self.ni_list   = ni_list
+        self.rank_list = rank_list
+
+        # Embeddings
+        self.E = torch.nn.Embedding(len(d.entities), d_e, padding_idx=0).to(device)
+        self.R = torch.nn.Embedding(len(d.relations), d_r, padding_idx=0).to(device)
+        self.E.weight.data.normal_(0, 1e-3)
+        self.R.weight.data.normal_(0, 1e-3)
+
+        # Core tensors G0..G3 with shapes:
+        #   G0: [r01, r02, r03, n0]
+        #   G1: [r01, r12, r13, n1]
+        #   G2: [r02, r12, r23, n2]
+        #   G3: [r03, r13, r23, n3]
+        edges = list(combinations(range(4), 2))
+        bond_ranks = {e: rank_list[i] for i,e in enumerate(edges)}
+        self.cores = torch.nn.ParameterList()
+        for i in range(4):
+            dims = [bond_ranks[(i,j) if i<j else (j,i)]
+                    for j in range(4) if j!=i] + [ni_list[i]]
+            G = torch.nn.Parameter(torch.empty(*dims, device=device).uniform_(-1e-1,1e-1))
+            self.cores.append(G)
+
+        # Norms & dropout
+        self.bnr = torch.nn.BatchNorm1d(d_r)
+        self.bne = torch.nn.BatchNorm1d(d_e)
+        self.bnw = torch.nn.BatchNorm1d(d_e)
+        self.input_dropout  = torch.nn.Dropout(kwargs.get("input_dropout",0.0))
+        self.hidden_dropout = torch.nn.Dropout(kwargs.get("hidden_dropout",0.0))
+
+        # ==== Precompute all slice boundaries once ====
+        def make_bounds(n):
+            step = math.ceil(n / chunks)
+            cuts = list(range(0, n, step))
+            return [(cuts[k], cuts[k+1]) for k in range(len(cuts)-1)] + [(cuts[-1], n)]
+
+        n0,n1,n2,n3 = ni_list
+        r01, r02, r03, r12, r13, r23 = rank_list
+
+        self.a_slices = make_bounds(n0)
+        self.b_slices = make_bounds(n1)
+        self.c_slices = make_bounds(n2)
+        self.d_slices = make_bounds(n3)
+        self.i_slices = make_bounds(r01)
+        self.m_slices = make_bounds(r23)
+
+    def forward(self, r_idx, e_idx, miss, W=None):
+        device = self.device
+        B      = r_idx.size(0)
+        G0,G1,G2,G3 = self.cores
+        n0,n1,n2,n3   = self.ni_list
+        r01, r02, r03, r12, r13, r23 = self.rank_list
+
+        # 1) Lookup & drop out embeddings
+        r_emb = self.input_dropout(self.bnr(self.R(r_idx)))  # (B, r01)
+        e2    = self.input_dropout(self.bne(self.E(e_idx[0])))# (B, de)
+        e3    = self.input_dropout(self.bne(self.E(e_idx[1])))# (B, de)
+
+        # 2) Prepare final logits buffer
+        out_sizes = {1: n1, 2: n2, 3: n3}
+        logits    = torch.zeros(B, out_sizes[miss], device=device)
+
+        # 3) Loop over a-chunk, b-chunk
+        for (a0,a1) in self.a_slices:
+            G0_a = G0[..., a0:a1]            # [r01, r02, r03, a_slice]
+            r_sub = r_emb[:, a0:a1]          # (B, a_slice)
+            a_slice = a1 - a0
+
+            for (b0,b1) in self.b_slices:
+                G1_b = G1[..., b0:b1]        # [r01, r12, r13, b_slice]
+                b_slice = b1 - b0
+
+                # 4) In-place accumulate K01_sum over the i-chunks
+                # shape = [r02, r03, a_slice, r12, r13, b_slice]
+                K01_sum = torch.zeros(
+                    r02, r03, a_slice, r12, r13, b_slice,
+                    device=device
+                )
+                for (i0,i1) in self.i_slices:
+                    part01 = torch.einsum(
+                        'ijka,inlb->jkanlb',
+                        G0_a[i0:i1],     # [i_slice, r02, r03, a_slice]
+                        G1_b[i0:i1]      # [i_slice, r12, r13, b_slice]
+                    )
+                    K01_sum.add_(part01)
+                    del part01
+
+                # 5) Now loop over c/d slices and chunk m for K23
+                for (c0,c1) in self.c_slices:
+                    c_slice = c1 - c0
+                    G2_c    = G2[..., c0:c1]    # [r02, r12, r23, c_slice]
+
+                    for (d0,d1) in self.d_slices:
+                        d_slice = d1 - d0
+                        G3_d    = G3[..., d0:d1]  # [r03, r13, r23, d_slice]
+
+                        # In-place accumulate K23_sum over m–chunks
+                        # shape = [r02, r12, c_slice, r03, r13, d_slice]
+                        K23_sum = torch.zeros(
+                            r02, r12, c_slice, r03, r13, d_slice,
+                            device=device
+                        )
+                        for (m0,m1) in self.m_slices:
+                            part23 = torch.einsum(
+                                'jnmc,klmd->jnckld',
+                                G2_c[..., m0:m1, :],  # [r02, r12, m_slice, c_slice]
+                                G3_d[..., m0:m1, :]   # [r03, r13, m_slice, d_slice]
+                            )
+                            K23_sum.add_(part23)
+                            del part23
+
+                        # 6) Fuse K01_sum + K23_sum → tiny [a_slice,b_slice,c_slice,d_slice]
+                        block = torch.einsum(
+                            'jkanlb,jnckld->abcd',
+                            K01_sum, K23_sum
+                        )
+                        del K23_sum  # done with this
+
+                        # 7) Fuse relation → partial [B,b,c,d]
+                        partial = torch.einsum(
+                            'Ba,abcd->Bbcd',
+                            r_sub, block
+                        )
+                        del block
+
+                        # 8) Contract known entity embeddings directly into logits
+                        if miss == 1:
+                            ec = e2[:, c0:c1]
+                            ed = e3[:, d0:d1]
+                            logits[:, b0:b1].add_(torch.einsum(
+                                'Bbcd,Bc,Bd->Bb',
+                                partial, ec, ed
+                            ))
+                        elif miss == 2:
+                            eb = e2[:, b0:b1]
+                            ed = e3[:, d0:d1]
+                            logits[:, c0:c1].add_(torch.einsum(
+                                'Bbcd,Bb,Bd->Bc',
+                                partial, eb, ed
+                            ))
+                        else:  # miss==3
+                            eb = e2[:, b0:b1]
+                            ec = e3[:, c0:c1]
+                            logits[:, d0:d1].add_(torch.einsum(
+                                'Bbcd,Bb,Bc->Bd',
+                                partial, eb, ec
+                            ))
+                        del partial
+
+                del K01_sum  # done with a/b block
+
+        # 9) Final batch‐norm, dropout, and raw scores
+        out = self.hidden_dropout(self.bnw(logits))
+        x   = out @ self.E.weight.t()   # (B, #entities)
+
+        return x, W
 
 
 

@@ -154,7 +154,7 @@ class Experiment:
              hidden_dropout=args.hidden_dropout)
         elif args.method == 'FC':
             #model = GETD(d, args.edim, args.rdim, args.k, args.n_i, args.TR_ranks, device, input_dropout=args.input_dropout, hidden_dropout=args.hidden_dropout)
-            model = GETD_new_FC(d, args.edim, args.rdim, args.ni_list, args.rank_list, device, 30,
+            model = GETD_FC_chunked(d, args.edim, args.rdim, args.ni_list, args.rank_list, device, 30,
              input_dropout=args.input_dropout,
              hidden_dropout=args.hidden_dropout)
             # model = GETD_FC_pos(t
