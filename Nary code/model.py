@@ -35,6 +35,130 @@ import torch.nn as nn
 import torch.nn.functional as F
 from itertools import combinations
 
+class GETD_FC_chunked_test(nn.Module):
+    def __init__(
+        self, d, d_e, d_r, ni_list, rank_list, device, chunks, **kwargs
+    ):
+        super().__init__()
+        n0, n1, n2, n3 = ni_list
+        assert n0 == d_r
+        assert n1 == d_e and n2 == d_e and n3 == d_e
+
+        self.device = device
+        self.chunks = chunks
+        
+        self.ni_list = ni_list
+        self.rank_list = rank_list
+
+        self.E = nn.Embedding(len(d.entities), d_e, padding_idx=0)
+        self.R = nn.Embedding(len(d.relations), d_r, padding_idx=0)
+        self.bnr = nn.BatchNorm1d(d_r)
+        self.bne = nn.BatchNorm1d(d_e)
+        self.input_dropout = nn.Dropout(kwargs.get("input_dropout", 0.0))
+        self.hidden_dropout = nn.Dropout(kwargs.get("input_dropout", 0.0))
+        self.bn_out = nn.ModuleList([
+            nn.BatchNorm1d(n1),
+            nn.BatchNorm1d(n2),
+            nn.BatchNorm1d(n3),
+        ])
+        r0, r1, r2, r3, r4, r5 = rank_list
+        self.cores = nn.ParameterList([
+            nn.Parameter(torch.randn(r0, r1, r2, n0)),
+            nn.Parameter(torch.randn(r0, r3, r4, n1)),
+            nn.Parameter(torch.randn(r1, r3, r5, n2)),
+            nn.Parameter(torch.randn(r2, r4, r5, n3)),
+        ])
+        self.to(device)
+
+    def forward(self, r_idx, e_idx, miss, W=None):
+        B = r_idx.size(0)
+        G0, G1, G2, G3 = self.cores
+        n0, n1, n2, n3 = self.ni_list
+        r0, r1, r2, r3, r4, r5 = self.rank_list
+        device = r_idx.device
+
+        def boundaries(N):
+            base, rem = divmod(N, self.chunks)
+            bounds = [0]
+            for i in range(self.chunks):
+                bounds.append(bounds[-1] + base + (1 if i < rem else 0))
+            return bounds
+
+        # chunk boundaries for embedding axes
+        a_bounds = boundaries(n0)
+        b_bounds = boundaries(n1)
+        c_bounds = boundaries(n2)
+        d_bounds = boundaries(n3)
+
+        out_sizes = [n1, n2, n3]
+        logits = torch.zeros(B, out_sizes[miss-1], device=device)
+
+        # Embed, norm, dropout
+        r_emb = self.input_dropout(self.bnr(self.R(r_idx)))  # (B, n0)
+        e2 = self.input_dropout(self.bne(self.E(e_idx[0])))  # (B, n1)
+        e3 = self.input_dropout(self.bne(self.E(e_idx[1])))  # (B, n2)
+
+        # chunked contraction over K01 (no full K01 in memory)
+        for a0, a1 in zip(a_bounds[:-1], a_bounds[1:]):
+            for b0, b1 in zip(b_bounds[:-1], b_bounds[1:]):
+                G0_blk = G0[..., a0:a1]          # (r0, r1, r2, a1-a0)
+                G1_blk = G1[..., b0:b1]          # (r0, r3, r4, b1-b0)
+                # K01 only for this (a,b) block
+                K01_blk = torch.einsum('ijka,ilmb->jkalm b', G0_blk, G1_blk)
+                r_slice = r_emb[:, a0:a1]        # (B, a1-a0)
+
+                for c0, c1 in zip(c_bounds[:-1], c_bounds[1:]):
+                    for d0, d1 in zip(d_bounds[:-1], d_bounds[1:]):
+                        G2_blk = G2[:, :, :, c0:c1]
+                        G3_blk = G3[:, :, :, d0:d1]
+                        K23_sum = torch.einsum('jlmc,knmd->jlkncd', G2_blk, G3_blk)
+
+                        # ---- CHUNKED PART: chunk over j for block einsum ----
+                        J = K01_blk.shape[0]
+                        j_chunks = self.einsum_j_chunks
+                        j_bounds = [0] + [J * (i+1) // j_chunks for i in range(j_chunks)]
+
+                        block = torch.zeros(a1-a0, b1-b0, c1-c0, d1-d0, device=device)
+                        for j0, j1 in zip(j_bounds[:-1], j_bounds[1:]):
+                            K01_j = K01_blk[j0:j1]         # (j1-j0, k, a, l, m, b)
+                            K23_j = K23_sum[j0:j1]         # (j1-j0, l, k, n, c, d)
+                            # permute to align axes for contraction:
+                            # [j,k,a,l,m,b] -> [j,k,l,m,a,b]
+                            # [j,l,k,n,c,d] -> [j,k,l,n,c,d]
+                            K01_jp = K01_j.permute(0,1,3,4,2,5)  # j,k,l,m,a,b
+                            K23_jp = K23_j.permute(0,2,1,3,4,5)  # j,k,l,n,c,d
+                            block += torch.einsum('jklmab,jklncd->abcd', K01_jp, K23_jp)
+                        # ---- END CHUNKED PART ----
+
+                        # partial: (B, a, b, c, d)
+                        partial = torch.einsum('Ba,abcd->Bbcd', r_slice, block)
+
+                        # ec, ed = e2[:, c0:c1], e3[:, d0:d1]
+                        # logits[:, b0:b1] += torch.einsum(
+                        #     'Bbcd,Bc,Bd->Bb', partial, ec, ed
+                        # )
+                        # Contract known entities -> logits
+                        if miss == 1:
+                            ec, ed = e2[:, c0:c1], e3[:, d0:d1]
+                            logits[:, b0:b1] += torch.einsum(
+                                'Bbcd,Bc,Bd->Bb', partial, ec, ed
+                            )
+                        elif miss == 2:
+                            eb, ed = e2[:, b0:b1], e3[:, d0:d1]
+                            logits[:, c0:c1] += torch.einsum(
+                                'Bbcd,Bb,Bd->Bc', partial, eb, ed
+                            )
+                        else:
+                            eb, ec = e2[:, b0:b1], e3[:, c0:c1]
+                            logits[:, d0:d1] += torch.einsum(
+                                'Bbcd,Bb,Bc->Bd', partial, eb, ec
+                            )
+
+        logits = self.bn_out[miss-1](logits)
+        logits = self.hidden_dropout(logits)
+        out = logits @ self.E.weight.t()  # (B, num_entities)
+        return out, W
+
 class GETD_FC_opt_pos(nn.Module):
     """
     Fully-connected GETD model with on-the-fly contraction,
