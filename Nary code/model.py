@@ -98,9 +98,11 @@ class GETD_FC_chunked_gpu(nn.Module): ##loops removed, gpu friendly
                 # shape: [r1, r2, a_len, r3, r4, n1]
 
                 for c0, c1 in zip(c_starts, c_ends):
-                    # slice along mode-2
-                    G2_c = G2[..., c0:c1, :]  # shape [r1, r3, c_len, r2]
-                    # sum over bond-rank r5
+                    # slice along mode-2 (n2 axis)
+                    G2_c = G2[..., c0:c1]  # shape [r1, r3, r5, c_len]
+                    # sum over bond-rank r5 (axis2)
+                    # sum over bond-rank r5 (axis2)
+                    K23_sum = torch.tensordot(G2_c, G3, dims=([2], [2]))
                     K23_sum = torch.tensordot(G2_c, G3, dims=([2], [2]))
                     # shape: [r1, r3, c_len, r2, r4, n3]
 
@@ -110,7 +112,8 @@ class GETD_FC_chunked_gpu(nn.Module): ##loops removed, gpu friendly
                         dims=([0, 1, 3, 4], [0, 3, 1, 4])
                     )
                     # accumulate into full core
-                    block[a0:a1, :, c0:c1, :] = sub_block
+                    # accumulate this sub-block into the full core
+                    block[a0:a1, :, c0:c1, :] += sub_block
 
             # Relation contraction
             core_r = torch.einsum('Ba,abcd->Bbcd', r_emb, block)
