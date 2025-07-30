@@ -61,66 +61,75 @@ class GETD_FC_chunked_gpu(nn.Module): ##loops removed, gpu friendly
 
         # Move to GPU
         self.to(device)
-
     def forward(self, r_idx, e_idx, miss, W=None):
-        device = r_idx.device
-        # Embeddings + batchnorm + dropout
-        r_emb = self.input_dropout(self.bnr(self.R(r_idx)))    # (B, n0)
-        e2    = self.input_dropout(self.bne(self.E(e_idx[0]))) # (B, n2)
-        e3    = self.input_dropout(self.bne(self.E(e_idx[1]))) # (B, n3)
+            device = r_idx.device
+            # Embeddings + batchnorm + dropout
+            r_emb = self.input_dropout(self.bnr(self.R(r_idx)))    # (B, n0)
+            e2    = self.input_dropout(self.bne(self.E(e_idx[0]))) # (B, n2)
+            e3    = self.input_dropout(self.bne(self.E(e_idx[1]))) # (B, n3)
 
-        # Unpack cores & sizes
-        G0, G1, G2, G3 = self.cores
-        n0, n1, n2, n3 = self.ni_list
-        r0, r1, r2, r3, r4, r5 = self.rank_list
+            # Unpack cores & sizes
+            G0, G1, G2, G3 = self.cores
+            n0, n1, n2, n3 = self.ni_list
+            r0, r1, r2, r3, r4, r5 = self.rank_list
 
-        # Pre-allocate the final 4-D core tensor
-        block = torch.zeros(n0, n1, n2, n3, device=device)
+            # Pre-allocate the final 4-D core tensor
+            block = torch.zeros(n0, n1, n2, n3, device=device)
 
-        # Determine chunk sizes along bond-ranks
-        ci = math.ceil(r0 / self.chunks)
-        cm = math.ceil(r5 / self.chunks)
+            # Determine chunk sizes along bond-ranks
+            ci = math.ceil(r0 / self.chunks)
+            cm = math.ceil(r5 / self.chunks)
 
-        # Chunked partial contractions
-        for i0 in range(0, r0, ci):
-            i1 = min(r0, i0 + ci)
-            # Partial K01 along axis 0
-            K01_part = torch.tensordot(
-                G0[i0:i1], G1[i0:i1], dims=([0], [0])
-            )  # shape [r1, r2, n0, r3, r4, n1]
+                    # Chunked partial contractions along output modes n0 and n2
+            # boundaries for mode-0 (dimension n0) and mode-2 (dimension n2)
+            def bounds(n):
+                step = math.ceil(n / self.chunks)
+                cuts = list(range(0, n, step)) + [n]
+                return cuts[:-1], cuts[1:]
 
-            for m0 in range(0, r5, cm):
-                m1 = min(r5, m0 + cm)
-                # Partial K23 along axis 2
-                K23_part = torch.tensordot(
-                    G2[..., m0:m1, :], G3[..., m0:m1, :], dims=([2], [2])
-                )  # shape [r1, r3, n2, r2, r4, n3]
+            a_starts, a_ends = bounds(n0)
+            c_starts, c_ends = bounds(n2)
 
-                # Fuse partials into a sub-block and accumulate
-                sub_block = torch.tensordot(
-                    K01_part, K23_part,
-                    dims=([0, 1, 3, 4], [0, 3, 1, 4])
-                )  # shape [n0, n1, n2, n3]
-                block += sub_block
-        
-        # Relation contraction
-        core_r = torch.einsum('Ba,abcd->Bbcd', r_emb, block)
+            for a0, a1 in zip(a_starts, a_ends):
+                # slice along mode-0
+                G0_a = G0[..., a0:a1]  # shape [r0, r1, r2, a_len]
+                # sum over bond-rank r0
+                K01_sum = torch.tensordot(G0_a, G1, dims=([0], [0]))
+                # shape: [r1, r2, a_len, r3, r4, n1]
 
-        # Final known-entity contraction to produce logits
-        if miss == 1:
-            logits = torch.einsum('Bbcd,Bc,Bd->Bb', core_r, e2, e3)
-        elif miss == 2:
-            e1     = self.input_dropout(self.bne(self.E(e_idx[0])))
-            logits = torch.einsum('Bbcd,Bb,Bd->Bc', core_r, e1, e3)
-        else:
-            e1     = self.input_dropout(self.bne(self.E(e_idx[0])))
-            logits = torch.einsum('Bbcd,Bb,Bc->Bd', core_r, e1, e2)
+                for c0, c1 in zip(c_starts, c_ends):
+                    # slice along mode-2
+                    G2_c = G2[..., c0:c1, :]  # shape [r1, r3, c_len, r2]
+                    # sum over bond-rank r5
+                    K23_sum = torch.tensordot(G2_c, G3, dims=([2], [2]))
+                    # shape: [r1, r3, c_len, r2, r4, n3]
 
-        # Final batchnorm + dropout + projection + softmax
-        logits = self.hidden_dropout(self.bnw(logits))
-        out    = logits @ self.E.weight.t()
-        pred   = F.softmax(out, dim=1)
-        return pred, W
+                    # fuse partial sums into sub-block of shape [a_len, n1, c_len, n3]
+                    sub_block = torch.tensordot(
+                        K01_sum, K23_sum,
+                        dims=([0, 1, 3, 4], [0, 3, 1, 4])
+                    )
+                    # accumulate into full core
+                    block[a0:a1, :, c0:c1, :] = sub_block
+
+            # Relation contraction
+            core_r = torch.einsum('Ba,abcd->Bbcd', r_emb, block)
+
+            # Final known-entity contraction to produce logits
+            if miss == 1:
+                logits = torch.einsum('Bbcd,Bc,Bd->Bb', core_r, e2, e3)
+            elif miss == 2:
+                e1     = self.input_dropout(self.bne(self.E(e_idx[0])))
+                logits = torch.einsum('Bbcd,Bb,Bd->Bc', core_r, e1, e3)
+            else:
+                e1     = self.input_dropout(self.bne(self.E(e_idx[0])))
+                logits = torch.einsum('Bbcd,Bb,Bc->Bd', core_r, e1, e2)
+
+            # Final batchnorm + dropout + projection + softmax
+            logits = self.hidden_dropout(self.bnw(logits))
+            out    = logits @ self.E.weight.t()
+            pred   = F.softmax(out, dim=1)
+            return pred, W
 
 import time
 import logging
