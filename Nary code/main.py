@@ -154,7 +154,7 @@ class Experiment:
              hidden_dropout=args.hidden_dropout)
         elif args.method == 'FC':
             #model = GETD(d, args.edim, args.rdim, args.k, args.n_i, args.TR_ranks, device, input_dropout=args.input_dropout, hidden_dropout=args.hidden_dropout)
-            model = GETD_FC_chunked_test(d, args.edim, args.rdim, args.ni_list, args.rank_list, device, 5,
+            model = GETD_FC_chunked_gpu(d, args.edim, args.rdim, args.ni_list, args.rank_list, device, 10,
              input_dropout=args.input_dropout,
              hidden_dropout=args.hidden_dropout)
             # model = GETD_FC_pos(t
@@ -188,8 +188,8 @@ class Experiment:
             )
         
         ##model = GETD(d, self.ent_vec_dim, self.rel_vec_dim, self.k, self.ni, self.ranks, device, **self.kwargs)
-        import torch
-        torch.cuda.empty_cache()
+        # import torch
+        # torch.cuda.empty_cache()
 
         model = model.to(device)
 

@@ -22,6 +22,105 @@ class MyLoss(torch.nn.Module):
         loss = F.binary_cross_entropy(pred1, tar1)
         return loss
 
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GETD_FC_chunked_gpu(nn.Module): ##loops removed, gpu friendly
+    def __init__(
+        self, data, d_e, d_r, ni_list, rank_list,
+        device, chunks=30, **kwargs
+    ):
+        super().__init__()
+        self.device = device
+        self.chunks = chunks
+        self.ni_list = ni_list
+        self.rank_list = rank_list
+
+        # Embeddings
+        self.E = nn.Embedding(len(data.entities), d_e, padding_idx=0)
+        self.R = nn.Embedding(len(data.relations), d_r, padding_idx=0)
+
+        # Batch norms + dropouts
+        self.bnr = nn.BatchNorm1d(d_r)
+        self.bne = nn.BatchNorm1d(d_e)
+        self.bnw = nn.BatchNorm1d(max(ni_list[1:]))
+        self.input_dropout = nn.Dropout(kwargs.get("input_dropout", 0.0))
+        self.hidden_dropout = nn.Dropout(kwargs.get("hidden_dropout", 0.0))
+
+        # Three-way cores
+        n0, n1, n2, n3 = ni_list
+        r0, r1, r2, r3, r4, r5 = rank_list
+        self.cores = nn.ParameterList([
+            nn.Parameter(torch.randn(r0, r1, r2, n0)),
+            nn.Parameter(torch.randn(r0, r3, r4, n1)),
+            nn.Parameter(torch.randn(r1, r3, r5, n2)),
+            nn.Parameter(torch.randn(r2, r4, r5, n3)),
+        ])
+
+        # Move to GPU
+        self.to(device)
+
+    def forward(self, r_idx, e_idx, miss, W=None):
+        device = r_idx.device
+        # Embeddings + batchnorm + dropout
+        r_emb = self.input_dropout(self.bnr(self.R(r_idx)))    # (B, n0)
+        e2    = self.input_dropout(self.bne(self.E(e_idx[0]))) # (B, n2)
+        e3    = self.input_dropout(self.bne(self.E(e_idx[1]))) # (B, n3)
+
+        # Unpack cores & sizes
+        G0, G1, G2, G3 = self.cores
+        n0, n1, n2, n3 = self.ni_list
+        r0, r1, r2, r3, r4, r5 = self.rank_list
+
+        # Pre-allocate the final 4-D core tensor
+        block = torch.zeros(n0, n1, n2, n3, device=device)
+
+        # Determine chunk sizes along bond-ranks
+        ci = math.ceil(r0 / self.chunks)
+        cm = math.ceil(r5 / self.chunks)
+
+        # Chunked partial contractions
+        for i0 in range(0, r0, ci):
+            i1 = min(r0, i0 + ci)
+            # Partial K01 along axis 0
+            K01_part = torch.tensordot(
+                G0[i0:i1], G1[i0:i1], dims=([0], [0])
+            )  # shape [r1, r2, n0, r3, r4, n1]
+
+            for m0 in range(0, r5, cm):
+                m1 = min(r5, m0 + cm)
+                # Partial K23 along axis 2
+                K23_part = torch.tensordot(
+                    G2[..., m0:m1, :], G3[..., m0:m1, :], dims=([2], [2])
+                )  # shape [r1, r3, n2, r2, r4, n3]
+
+                # Fuse partials into a sub-block and accumulate
+                sub_block = torch.tensordot(
+                    K01_part, K23_part,
+                    dims=([0, 1, 3, 4], [0, 3, 1, 4])
+                )  # shape [n0, n1, n2, n3]
+                block += sub_block
+        
+        # Relation contraction
+        core_r = torch.einsum('Ba,abcd->Bbcd', r_emb, block)
+
+        # Final known-entity contraction to produce logits
+        if miss == 1:
+            logits = torch.einsum('Bbcd,Bc,Bd->Bb', core_r, e2, e3)
+        elif miss == 2:
+            e1     = self.input_dropout(self.bne(self.E(e_idx[0])))
+            logits = torch.einsum('Bbcd,Bb,Bd->Bc', core_r, e1, e3)
+        else:
+            e1     = self.input_dropout(self.bne(self.E(e_idx[0])))
+            logits = torch.einsum('Bbcd,Bb,Bc->Bd', core_r, e1, e2)
+
+        # Final batchnorm + dropout + projection + softmax
+        logits = self.hidden_dropout(self.bnw(logits))
+        out    = logits @ self.E.weight.t()
+        pred   = F.softmax(out, dim=1)
+        return pred, W
 
 import time
 import logging
@@ -339,7 +438,7 @@ class GETD_FC_chunked(nn.Module):
         ])
 
         # Clear leftover cache then move modules & parameters to GPU
-        torch.cuda.empty_cache()
+        
         self.to(device)
 
     def forward(self, r_idx, e_idx, miss, W=None):
@@ -393,7 +492,7 @@ class GETD_FC_chunked(nn.Module):
                         G0_a[i0:i1,...], G1_b[i0:i1,...]
                     )
                     K01_sum = part01 if K01_sum is None else K01_sum + part01
-                    del part01; torch.cuda.empty_cache()
+                    del part01
 
                 for ic in range(len(c_bounds)-1):
                     c0,c1 = c_bounds[ic], c_bounds[ic+1]
@@ -416,11 +515,11 @@ class GETD_FC_chunked(nn.Module):
 
                         # Fuse partial sums -> 4D block
                         block   = torch.einsum('jkanlb,jnckld->abcd', K01_sum, K23_sum)
-                        del K23_sum; torch.cuda.empty_cache()
+                        del K23_sum; 
 
                         # Fuse relation
                         partial = torch.einsum('Ba,abcd->Bbcd', r_sub, block)
-                        del block; torch.cuda.empty_cache()
+                        del block; 
 
                         # Contract known entities -> logits
                         if miss == 1:
@@ -438,10 +537,10 @@ class GETD_FC_chunked(nn.Module):
                             logits[:, d0:d1] += torch.einsum(
                                 'Bbcd,Bb,Bc->Bd', partial, eb, ec
                             )
-                        del partial; torch.cuda.empty_cache()
+                        del partial;
 
                 # Clean up K01_sum after using in all c,d
-                del K01_sum; torch.cuda.empty_cache()
+                del K01_sum
 
         # Final batchnorm + dropout + final projection
         logits = self.hidden_dropout(self.bnw(logits))
@@ -449,7 +548,7 @@ class GETD_FC_chunked(nn.Module):
         pred   = F.softmax(out, dim=1)
 
         # Cleanup large tensors before returning
-        del G0, G1, G2, G3, r_emb, e2, e3, logits; torch.cuda.empty_cache()
+        del G0, G1, G2, G3, r_emb, e2, e3, logits; 
         return pred, W
 
 class GETD_new_FC(torch.nn.Module):
