@@ -7,12 +7,12 @@ from tensorly.decomposition import tucker, tensor_train, tensor_ring
 from tensorly.decomposition import tucker
 from itertools import combinations
 import string
-import opt_einsum as oe  # Make sure this is imported
+
+import opt_einsum as oe
 from opt_einsum import contract, contract_path
 
-
 tl.set_backend('pytorch')
-from opt_einsum import contract
+
 #from tensorly_torch.decomposition import hierarchical_tucker
 
 
@@ -72,6 +72,7 @@ class GETD_FC_chunked_gpu(nn.Module): ##loops removed, gpu friendly
                                          torch.zeros(r2, r4, r5, 1))[0]
 
         # Move to GPU
+        self._fc_path = None
         self.to(device)
     def forward(self, r_idx, e_idx, miss, W=None):
         device = r_idx.device
@@ -86,17 +87,34 @@ class GETD_FC_chunked_gpu(nn.Module): ##loops removed, gpu friendly
         G0, G1, G2, G3 = self.cores
 
         # 3) big, single optimized contraction
+        # print(f"[before big contract] alloc={torch.cuda.memory_allocated(device)>>20} MB")
+        # core_r = contract(
+        #     'Ba,ijka,inlb,jnmc,klmd->Bbcd',
+        #     r_emb,
+        #     G0, G1,
+        #     G2, G3,
+        #     optimize='optimal',
+        #     backend='torch'
+        # )
+        # # core_r will have shape (B, n1, n2, n3)
+        # print(f"[after big contract] alloc={torch.cuda.memory_allocated(device)>>20} MB")
+        eqn = 'Ba,ijka,inlb,jnmc,klmd->Bbcd'
+        operands = (r_emb, G0, G1, G2, G3)
+        if self._fc_path is None:
+            shapes = [x.shape for x in operands]
+            path, info = contract_path(eqn, *shapes, optimize='optimal')
+            print("⟳  opt_einsum chose path:", path)
+            print("   estimated FLOPs:", info.opt_flops, "   estimated memory:", info.opt_span)
+            self._fc_path = path  # cache it
+
+        # log memory before
         print(f"[before big contract] alloc={torch.cuda.memory_allocated(device)>>20} MB")
-        core_r = contract(
-            'Ba,ijka,inlb,jnmc,klmd->Bbcd',
-            r_emb,
-            G0, G1,
-            G2, G3,
-            optimize='optimal',
-            backend='torch'
-        )
-        # core_r will have shape (B, n1, n2, n3)
-        print(f"[after big contract] alloc={torch.cuda.memory_allocated(device)>>20} MB")
+
+        # do the contraction in that order
+        core_r = contract(eqn, *operands, optimize=self._fc_path, backend='torch')
+
+        # log memory after
+        print(f"[after  big contract] alloc={torch.cuda.memory_allocated(device)>>20} MB")
 
         # 4) final known‑entity contraction to get logits
         if miss == 1:
