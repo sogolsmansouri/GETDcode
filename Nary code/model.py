@@ -8,6 +8,8 @@ from tensorly.decomposition import tucker
 from itertools import combinations
 import string
 import opt_einsum as oe  # Make sure this is imported
+from opt_einsum import contract, contract_path
+
 
 tl.set_backend('pytorch')
 from opt_einsum import contract
@@ -71,70 +73,110 @@ class GETD_FC_chunked_gpu(nn.Module): ##loops removed, gpu friendly
 
         # Move to GPU
         self.to(device)
+        
     def forward(self, r_idx, e_idx, miss, W=None):
-        device = r_idx.device
-        torch.cuda.synchronize(device)
-        print(f"[forward start] alloc={torch.cuda.memory_allocated(device)>>20} MB  "
-              f"resv={torch.cuda.memory_reserved(device)>>20} MB")
+        dev = r_idx.device
+        torch.cuda.synchronize(dev)
+        print(f"[forward start] alloc={torch.cuda.memory_allocated(dev)>>20} MB  "
+              f"resv={torch.cuda.memory_reserved(dev)>>20} MB")
 
-        # 1) embeddings + batchnorm + dropout
+        # ————————————
+        # 1) Embeddings + BatchNorm + Dropout
         r_emb = self.input_dropout(self.bnr(self.R(r_idx)))   # (B, r0)
         e2    = self.input_dropout(self.bne(self.E(e_idx[0])))# (B, n2)
         e3    = self.input_dropout(self.bne(self.E(e_idx[1])))# (B, n3)
-        torch.cuda.synchronize(device)
-        print(f"[after embeds] alloc={torch.cuda.memory_allocated(device)>>20} MB")
+        torch.cuda.synchronize(dev)
+        print(f"[after embeds] alloc={torch.cuda.memory_allocated(dev)>>20} MB")
 
-        # 2) unpack cores & dims
+        # ————————————
+        # 2) Unpack cores & sizes
         G0, G1, G2, G3 = self.cores
-        n0,n1,n2,n3    = self.ni_list
+        n0, n1, n2, n3 = self.ni_list
 
-        # 3) preallocate final 4‑D block
-        block = torch.zeros(n0, n1, n2, n3, device=device)
-        torch.cuda.synchronize(device)
-        print(f"[after block alloc] block={block.shape}  alloc={torch.cuda.memory_allocated(device)>>20} MB")
+        # 3) Allocate the final 4‑D block
+        block = torch.zeros(n0, n1, n2, n3, device=dev)
+        torch.cuda.synchronize(dev)
+        print(f"[after block alloc] block={tuple(block.shape)}  "
+              f"alloc={torch.cuda.memory_allocated(dev)>>20} MB")
 
-        # 4) chunk boundaries
+        # 4) Helper to split a dimension into `chunks` slices
         def bounds(N):
             step = math.ceil(N / self.chunks)
             cuts = list(range(0, N, step)) + [N]
             return cuts[:-1], cuts[1:]
 
-        a_starts,a_ends = bounds(n0)
-        c_starts,c_ends = bounds(n2)
+        a_starts, a_ends = bounds(n0)
+        c_starts, c_ends = bounds(n2)
 
-        # 5) chunked fused contraction via opt_einsum
-        expr = 'ijka,inlb,jnmc,klmd->abcd'
-        for ia, (a0,a1) in enumerate(zip(a_starts,a_ends)):
-            G0_a = G0[..., a0:a1]             # [r0, r1, r2, a_len]
-            torch.cuda.synchronize(device)
-            print(f"[chunk {ia}] G0_a={G0_a.shape}  alloc={torch.cuda.memory_allocated(device)>>20} MB")
+        # ————————————
+        # 5) Chunked contractions
+        for ia, (a0,a1) in enumerate(zip(a_starts, a_ends)):
+            # slice G0 along its last (n0) axis
+            G0_a = G0[..., a0:a1]  # [r0, r1, r2, a_len]
+            torch.cuda.synchronize(dev)
+            print(f"[chunk {ia}] G0_a={tuple(G0_a.shape)}  "
+                  f"alloc={torch.cuda.memory_allocated(dev)>>20} MB")
 
-            for ic, (c0,c1) in enumerate(zip(c_starts,c_ends)):
-                G2_c = G2[..., c0:c1]         # [r1, r3, r5, c_len]
-                torch.cuda.synchronize(device)
-                print(f"  [chunk {ia},{ic}] G2_c={G2_c.shape}  alloc={torch.cuda.memory_allocated(device)>>20} MB")
+            # sum over the first bond‑rank r0 (index 'i'), fusing G0_a & G1:
+            # 'ijka,inlb->jkanlb'
+            K01_sum = torch.einsum(
+                'ijka,inlb->jkanlb',
+                G0_a, G1
+            )  # shape: [r1, r2, a_len, r3, r4, n1]
+            torch.cuda.synchronize(dev)
+            print(f"  [chunk {ia}] K01_sum={tuple(K01_sum.shape)}  "
+                  f"alloc={torch.cuda.memory_allocated(dev)>>20} MB")
 
-                # one fused contraction
-                sub_block = contract(
-                    expr, G0_a, G1, G2_c, G3,
-                    optimize=self._fused_path
+            for ic, (c0,c1) in enumerate(zip(c_starts, c_ends)):
+                # slice G2 along its last (n2) axis
+                G2_c = G2[..., c0:c1]  # [r1, r3, r5, c_len]
+                torch.cuda.synchronize(dev)
+                print(f"    [chunk {ia},{ic}] G2_c={tuple(G2_c.shape)}  "
+                      f"alloc={torch.cuda.memory_allocated(dev)>>20} MB")
+
+                # sum over the last bond‑rank r5, fusing G2_c & G3:
+                # 'jnmc,klmd->jnckld'
+                K23_sum = torch.einsum(
+                    'jnmc,klmd->jnckld',
+                    G2_c, G3
+                )  # shape: [r1, r3, c_len, r2, r4, n3]
+                torch.cuda.synchronize(dev)
+                print(f"    [chunk {ia},{ic}] K23_sum={tuple(K23_sum.shape)}  "
+                      f"alloc={torch.cuda.memory_allocated(dev)>>20} MB")
+
+                # now fuse those two 6‑D partials down to our 4‑D sub‑block:
+                # 'jkanlb,jnckld->abcd'
+                sub_block = torch.einsum(
+                    'jkanlb,jnckld->abcd',
+                    K01_sum, K23_sum
                 )  # [a_len, n1, c_len, n3]
-                torch.cuda.synchronize(device)
-                print(f"  [chunk {ia},{ic}] sub_block={sub_block.shape}  "
-                      f"alloc={torch.cuda.memory_allocated(device)>>20} MB")
+                torch.cuda.synchronize(dev)
+                print(f"    [chunk {ia},{ic}] sub_block={tuple(sub_block.shape)}  "
+                      f"alloc={torch.cuda.memory_allocated(dev)>>20} MB")
 
+                # accumulate
                 block[a0:a1, :, c0:c1, :] += sub_block
-                del sub_block
 
-        torch.cuda.synchronize(device)
-        print(f"[after block fill] alloc={torch.cuda.memory_allocated(device)>>20} MB")
+                # free the two big temps for this c‑chunk
+                del K23_sum, sub_block
+                torch.cuda.synchronize(dev)
 
-        # 6) fuse relation
+            # done with all c‑chunks for this a‑chunk: free K01_sum
+            del K01_sum
+            torch.cuda.synchronize(dev)
+
+        torch.cuda.synchronize(dev)
+        print(f"[after block fill] alloc={torch.cuda.memory_allocated(dev)>>20} MB")
+
+        # ————————————
+        # 6) Fuse in the relation embedding
         core_r = torch.einsum('Ba,abcd->Bbcd', r_emb, block)
-        torch.cuda.synchronize(device)
-        print(f"[after relation] core_r={core_r.shape}  alloc={torch.cuda.memory_allocated(device)>>20} MB")
+        torch.cuda.synchronize(dev)
+        print(f"[after relation] core_r={tuple(core_r.shape)}  "
+              f"alloc={torch.cuda.memory_allocated(dev)>>20} MB")
 
-        # 7) known-entity contraction → logits
+        # ————————————
+        # 7) Contract the known entities → logits
         if miss == 1:
             logits = torch.einsum('Bbcd,Bc,Bd->Bb', core_r, e2, e3)
         elif miss == 2:
@@ -143,20 +185,21 @@ class GETD_FC_chunked_gpu(nn.Module): ##loops removed, gpu friendly
         else:
             e1     = self.input_dropout(self.bne(self.E(e_idx[0])))
             logits = torch.einsum('Bbcd,Bb,Bc->Bd', core_r, e1, e2)
-        torch.cuda.synchronize(device)
-        print(f"[after logits] logits={logits.shape}  "
-              f"alloc={torch.cuda.memory_allocated(device)>>20} MB")
+        torch.cuda.synchronize(dev)
+        print(f"[after logits] logits={tuple(logits.shape)}  "
+              f"alloc={torch.cuda.memory_allocated(dev)>>20} MB")
 
-        # 8) final batchnorm + dropout + projection + softmax
+        # ————————————
+        # 8) Final batchnorm, dropout, project, softmax
         logits = self.hidden_dropout(self.bnw(logits))
         out    = logits @ self.E.weight.t()
         pred   = F.softmax(out, dim=1)
-        torch.cuda.synchronize(device)
-        print(f"[forward end] pred={pred.shape}  alloc={torch.cuda.memory_allocated(device)>>20} MB  "
-              f"resv={torch.cuda.memory_reserved(device)>>20} MB\n")
+        torch.cuda.synchronize(dev)
+        print(f"[forward end] pred={tuple(pred.shape)}  "
+              f"alloc={torch.cuda.memory_allocated(dev)>>20} MB  "
+              f"resv={torch.cuda.memory_reserved(dev)>>20} MB\n")
 
         return pred, W
-
 import time
 import logging
 from itertools import combinations
